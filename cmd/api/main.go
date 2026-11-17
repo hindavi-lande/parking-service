@@ -12,6 +12,7 @@ import (
 
 	"github.com/techverito/parking-service/internal/config"
 	"github.com/techverito/parking-service/internal/httpapi"
+	"github.com/techverito/parking-service/internal/notify"
 	"github.com/techverito/parking-service/internal/service"
 	"github.com/techverito/parking-service/internal/store/memory"
 )
@@ -24,9 +25,17 @@ func main() {
 	lots := memory.NewLotStore()
 	sessions := memory.NewSessionStore()
 
+	// An absent or partial Twilio configuration selects the log-only notifier,
+	// so the service starts without an account.
+	notifier := notify.New(notify.Settings{
+		AccountSID: cfg.TwilioAccountSID,
+		AuthToken:  cfg.TwilioAuthToken,
+		FromNumber: cfg.TwilioFromNumber,
+	}, logger)
+
 	server := &http.Server{
 		Addr:              cfg.Addr,
-		Handler:           httpapi.NewRouter(service.NewLotService(lots, time.Now), service.NewSessionService(lots, sessions, time.Now), logger),
+		Handler:           httpapi.NewRouter(service.NewLotService(lots, time.Now), service.NewSessionService(lots, sessions, notifier, logger, time.Now), logger),
 		ReadHeaderTimeout: cfg.ReadTimeout,
 		ReadTimeout:       cfg.ReadTimeout,
 		WriteTimeout:      cfg.WriteTimeout,

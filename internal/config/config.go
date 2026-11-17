@@ -8,24 +8,30 @@ import (
 
 // Config holds every setting the service reads from the environment.
 type Config struct {
-	Env             string
-	Addr            string
-	ReadTimeout     time.Duration
-	WriteTimeout    time.Duration
-	IdleTimeout     time.Duration
-	ShutdownTimeout time.Duration
+	Env              string
+	Addr             string
+	ReadTimeout      time.Duration
+	WriteTimeout     time.Duration
+	IdleTimeout      time.Duration
+	ShutdownTimeout  time.Duration
+	TwilioAccountSID string
+	TwilioAuthToken  string
+	TwilioFromNumber string
 }
 
 // Load reads the configuration, falling back to local-friendly defaults so the
 // service starts with no environment set up.
 func Load() Config {
 	return Config{
-		Env:             stringEnv("APP_ENV", "local"),
-		Addr:            stringEnv("APP_ADDR", ":8080"),
-		ReadTimeout:     durationEnv("HTTP_READ_TIMEOUT", 5*time.Second),
-		WriteTimeout:    durationEnv("HTTP_WRITE_TIMEOUT", 10*time.Second),
-		IdleTimeout:     durationEnv("HTTP_IDLE_TIMEOUT", 60*time.Second),
-		ShutdownTimeout: durationEnv("HTTP_SHUTDOWN_TIMEOUT", 10*time.Second),
+		Env:              stringEnv("APP_ENV", "local"),
+		Addr:             stringEnv("APP_ADDR", ":8080"),
+		ReadTimeout:      durationEnv("HTTP_READ_TIMEOUT", 5*time.Second),
+		WriteTimeout:     durationEnv("HTTP_WRITE_TIMEOUT", 10*time.Second),
+		IdleTimeout:      durationEnv("HTTP_IDLE_TIMEOUT", 60*time.Second),
+		ShutdownTimeout:  durationEnv("HTTP_SHUTDOWN_TIMEOUT", 10*time.Second),
+		TwilioAccountSID: stringEnv("TWILIO_ACCOUNT_SID", ""),
+		TwilioAuthToken:  stringEnv("TWILIO_AUTH_TOKEN", ""),
+		TwilioFromNumber: stringEnv("TWILIO_FROM_NUMBER", ""),
 	}
 }
 

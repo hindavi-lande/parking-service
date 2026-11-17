@@ -24,6 +24,7 @@ type Session struct {
 	ID           string
 	LotID        string
 	Plate        string
+	Phone        string
 	Kind         SessionKind
 	Status       SessionStatus
 	CheckedInAt  time.Time

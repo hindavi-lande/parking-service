@@ -40,13 +40,16 @@ Everything is versioned under `/api/v1`. Times are UTC, RFC 3339.
 | `POST` | `/api/v1/lots`                    | create a lot (`name`, `address`, `capacity`)        |
 | `GET`  | `/api/v1/lots`                    | list lots, oldest first                            |
 | `GET`  | `/api/v1/lots/{lotID}`            | read one lot                                       |
-| `POST` | `/api/v1/lots/{lotID}/check-ins`  | check a vehicle in (`plate`, optional `kind`)       |
+| `POST` | `/api/v1/lots/{lotID}/check-ins`  | check a vehicle in (`plate`, optional `kind`, optional `phone`) |
 | `GET`  | `/api/v1/sessions/{sessionID}`    | read one session                                   |
 | `POST` | `/api/v1/sessions/{sessionID}/checkout` | end an active session                        |
 
 `kind` is `STANDARD` (default) or `EV`. Plates are trimmed, internal whitespace is
 collapsed and the value is upper-cased. A plate is 2–15 characters: letters, digits, spaces
 and hyphens.
+
+`phone` is optional and, when present, must be an E.164 number such as `+14155552671`. The
+session response repeats it as `phone` and omits the key when no number was given.
 
 Example:
 
@@ -56,14 +59,35 @@ curl -s -X POST localhost:8080/api/v1/lots \
   -H 'Content-Type: application/json' \
   -d '{"name":"Central Plaza","address":"MG Road","capacity":2}'
 
-# check in
+# check in and ask for the confirmation SMS
 curl -s -X POST localhost:8080/api/v1/lots/<lotID>/check-ins \
   -H 'Content-Type: application/json' \
-  -d '{"plate":"ka 01 ab 1234","kind":"EV"}'
+  -d '{"plate":"ka 01 ab 1234","kind":"EV","phone":"+14155552671"}'
+
+# the response repeats the phone; without one the key is omitted
+# {"id":"...","lotId":"...","plate":"KA 01 AB 1234","phone":"+14155552671", ...}
 
 # check out
 curl -s -X POST localhost:8080/api/v1/sessions/<sessionID>/checkout
 ```
+
+### SMS confirmation
+
+A check-in that carries a `phone` sends one confirmation SMS after the session is created. The
+message names the lot, the plate and the session start time, rendered as RFC 3339 UTC:
+
+```text
+Central Plaza: KA 01 AB 1234 checked in at 2026-02-14T09:30:00Z
+```
+
+The body always fits one 160-character SMS segment; a lot name that would push it over is
+shortened with `...`. Delivery is a single best-effort attempt: there is no retry and no queue,
+so a Twilio rejection or timeout is logged with the session id and neither fails the check-in
+nor removes the session. A check-in without a phone sends nothing, and a number that is not in
+E.164 form is rejected with `400 VALIDATION_FAILED` before the session is created.
+
+When the Twilio settings are absent a log-only notifier writes the same message at info level
+along with the recipient and the session id, so local development and tests need no account.
 
 ### Errors
 
@@ -102,6 +126,13 @@ Copy `.env.example` to `.env` only when you need to override something, then exp
 | `HTTP_WRITE_TIMEOUT`     | `10s`   | write timeout                       |
 | `HTTP_IDLE_TIMEOUT`      | `60s`   | keep-alive idle timeout             |
 | `HTTP_SHUTDOWN_TIMEOUT`  | `10s`   | grace period for in-flight requests |
+| `TWILIO_ACCOUNT_SID`     | unset   | Twilio account SID; any missing value selects the log-only notifier |
+| `TWILIO_AUTH_TOKEN`      | unset   | Twilio auth token; any missing value selects the log-only notifier |
+| `TWILIO_FROM_NUMBER`     | unset   | number the SMS is sent from; any missing value selects the log-only notifier |
+
+The three `TWILIO_*` settings are needed together: when any one of them is unset the service
+starts normally and writes the confirmation message to the log instead of sending it. Real
+values belong in your own environment — never commit a credential to the repository.
 
 ## Project layout
 
