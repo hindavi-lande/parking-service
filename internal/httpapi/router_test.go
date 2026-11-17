@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/techverito/parking-service/internal/httpapi"
+	"github.com/techverito/parking-service/internal/notify"
 	"github.com/techverito/parking-service/internal/service"
 	"github.com/techverito/parking-service/internal/store/memory"
 )
@@ -25,7 +26,7 @@ func newTestServer(t *testing.T) *httptest.Server {
 
 	server := httptest.NewServer(httpapi.NewRouter(
 		service.NewLotService(lots, time.Now),
-		service.NewSessionService(lots, sessions, time.Now),
+		service.NewSessionService(lots, sessions, time.Now, notify.NewLogNotifier(logger), logger),
 		logger,
 	))
 	t.Cleanup(server.Close)
@@ -86,6 +87,7 @@ type sessionBody struct {
 	ID           string     `json:"id"`
 	LotID        string     `json:"lotId"`
 	Plate        string     `json:"plate"`
+	Phone        string     `json:"phone"`
 	Kind         string     `json:"kind"`
 	Status       string     `json:"status"`
 	CheckedInAt  time.Time  `json:"checkedInAt"`
@@ -201,6 +203,74 @@ func TestCheckInAndCheckout(t *testing.T) {
 	}
 	if got := decode[problemBody](t, payload).Code; got != "SESSION_NOT_ACTIVE" {
 		t.Errorf("code = %q, want SESSION_NOT_ACTIVE", got)
+	}
+}
+
+func TestCheckInWithPhoneReturnsAndPersistsIt(t *testing.T) {
+	server := newTestServer(t)
+	lot := createLot(t, server, 1)
+
+	resp, payload := request(t, server, http.MethodPost, "/api/v1/lots/"+lot.ID+"/check-ins", map[string]any{
+		"plate": "ka 01 ab 1234",
+		"phone": "+14155552671",
+	})
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("check-in status = %d, body = %s", resp.StatusCode, payload)
+	}
+	session := decode[sessionBody](t, payload)
+	if session.Phone != "+14155552671" {
+		t.Errorf("phone = %q, want the submitted number", session.Phone)
+	}
+
+	resp, payload = request(t, server, http.MethodGet, "/api/v1/sessions/"+session.ID, nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("get session status = %d, want 200", resp.StatusCode)
+	}
+	if got := decode[sessionBody](t, payload); got.Phone != "+14155552671" {
+		t.Errorf("phone = %q, want the persisted number", got.Phone)
+	}
+}
+
+func TestCheckInRejectsInvalidPhone(t *testing.T) {
+	phones := []string{
+		"4155552671",        // no leading +
+		"+0123456789",       // leading zero
+		"abc",               // not a number
+		"+1234567890123456", // 16 digits, longer than E.164 allows
+	}
+
+	for _, phone := range phones {
+		t.Run(phone, func(t *testing.T) {
+			server := newTestServer(t)
+			lot := createLot(t, server, 1)
+
+			resp, payload := request(t, server, http.MethodPost, "/api/v1/lots/"+lot.ID+"/check-ins", map[string]any{
+				"plate": "KA 01 AB 1234",
+				"phone": phone,
+			})
+			if resp.StatusCode != http.StatusBadRequest {
+				t.Fatalf("status = %d, want 400; body = %s", resp.StatusCode, payload)
+			}
+			if contentType := resp.Header.Get("Content-Type"); !strings.HasPrefix(contentType, "application/problem+json") {
+				t.Errorf("Content-Type = %q, want application/problem+json", contentType)
+			}
+			body := decode[problemBody](t, payload)
+			if body.Code != "VALIDATION_FAILED" {
+				t.Errorf("code = %q, want VALIDATION_FAILED", body.Code)
+			}
+			if body.Status != http.StatusBadRequest {
+				t.Errorf("status field = %d, want 400", body.Status)
+			}
+
+			// The rejected request must not have taken the lot's only space.
+			resp, payload = request(t, server, http.MethodPost, "/api/v1/lots/"+lot.ID+"/check-ins", map[string]any{
+				"plate": "KA 02 CD 5678",
+				"phone": "+14155552671",
+			})
+			if resp.StatusCode != http.StatusCreated {
+				t.Fatalf("check-in after a rejected phone status = %d, want 201; body = %s", resp.StatusCode, payload)
+			}
+		})
 	}
 }
 

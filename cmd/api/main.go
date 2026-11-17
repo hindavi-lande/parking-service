@@ -12,6 +12,7 @@ import (
 
 	"github.com/techverito/parking-service/internal/config"
 	"github.com/techverito/parking-service/internal/httpapi"
+	"github.com/techverito/parking-service/internal/notify"
 	"github.com/techverito/parking-service/internal/service"
 	"github.com/techverito/parking-service/internal/store/memory"
 )
@@ -24,9 +25,12 @@ func main() {
 	lots := memory.NewLotStore()
 	sessions := memory.NewSessionStore()
 
+	lotService := service.NewLotService(lots, time.Now)
+	sessionService := service.NewSessionService(lots, sessions, time.Now, newNotifier(cfg, logger), logger)
+
 	server := &http.Server{
 		Addr:              cfg.Addr,
-		Handler:           httpapi.NewRouter(service.NewLotService(lots, time.Now), service.NewSessionService(lots, sessions, time.Now), logger),
+		Handler:           httpapi.NewRouter(lotService, sessionService, logger),
 		ReadHeaderTimeout: cfg.ReadTimeout,
 		ReadTimeout:       cfg.ReadTimeout,
 		WriteTimeout:      cfg.WriteTimeout,
@@ -59,4 +63,16 @@ func main() {
 		os.Exit(1)
 	}
 	logger.Info("server stopped")
+}
+
+// newNotifier picks the messaging provider: Twilio once all three settings are
+// present, the log-only notifier otherwise, so local development and tests need
+// no account. The auth token is never logged.
+func newNotifier(cfg config.Config, logger *slog.Logger) notify.Notifier {
+	if cfg.TwilioConfigured() {
+		logger.Info("using the twilio notifier", "from_number", cfg.TwilioFromNumber)
+		return notify.NewTwilioNotifier(cfg.TwilioAccountSID, cfg.TwilioAuthToken, cfg.TwilioFromNumber, logger)
+	}
+	logger.Info("using the log-only notifier", "reason", "twilio settings are not configured")
+	return notify.NewLogNotifier(logger)
 }

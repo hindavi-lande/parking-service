@@ -20,10 +20,13 @@ const (
 )
 
 // Session is one vehicle parked in one lot between check-in and checkout.
+// Phone is optional: it is empty when the caller did not supply a number and an
+// E.164 number (e.g. +14155552671) when set.
 type Session struct {
 	ID           string
 	LotID        string
 	Plate        string
+	Phone        string
 	Kind         SessionKind
 	Status       SessionStatus
 	CheckedInAt  time.Time
