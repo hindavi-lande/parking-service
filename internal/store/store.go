@@ -23,3 +23,14 @@ type SessionStore interface {
 	Update(ctx context.Context, session domain.Session) error
 	CountActiveByLot(ctx context.Context, lotID string) (int, error)
 }
+
+// PaymentStore stores the payment of a session. A session has at most one
+// payment, so a repeated checkout cannot add a second charge.
+type PaymentStore interface {
+	// Create returns domain.ErrPaymentExists when the session already has a
+	// payment.
+	Create(ctx context.Context, payment domain.Payment) error
+	Get(ctx context.Context, id string) (domain.Payment, error)
+	GetBySession(ctx context.Context, sessionID string) (domain.Payment, error)
+	Update(ctx context.Context, payment domain.Payment) error
+}

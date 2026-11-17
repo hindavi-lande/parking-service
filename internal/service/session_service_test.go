@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"io"
 	"log/slog"
 	"strings"
 	"testing"
@@ -11,11 +12,18 @@ import (
 
 	"github.com/techverito/parking-service/internal/domain"
 	"github.com/techverito/parking-service/internal/notify"
+	"github.com/techverito/parking-service/internal/payment"
 	"github.com/techverito/parking-service/internal/service"
 	"github.com/techverito/parking-service/internal/store/memory"
 )
 
-func newServices(t *testing.T) (*service.LotService, *service.SessionService, domain.Lot) {
+// defaultTestHourlyRate is the PAYMENT_HOURLY_RATE the services are wired with.
+const defaultTestHourlyRate = 5000
+
+// newHarness wires the services onto in-memory stores with the fake payment
+// provider and returns the payment store too, so a test can assert which
+// payments a session received.
+func newHarness(t *testing.T, msgNotifier notify.Notifier, logger *slog.Logger) (*service.LotService, *service.SessionService, *memory.PaymentStore, domain.Lot) {
 	t.Helper()
 
 	fixed := time.Date(2026, time.November, 17, 9, 0, 0, 0, time.UTC)
@@ -23,8 +31,18 @@ func newServices(t *testing.T) (*service.LotService, *service.SessionService, do
 
 	lots := memory.NewLotStore()
 	sessions := memory.NewSessionStore()
+	payments := memory.NewPaymentStore()
 	lotService := service.NewLotService(lots, clock)
-	sessionService := service.NewSessionService(lots, sessions, clock, nil, nil)
+
+	if logger == nil {
+		logger = slog.New(slog.NewTextHandler(io.Discard, nil))
+	}
+	provider, err := payment.FromName(payment.FakeProviderName)
+	if err != nil {
+		t.Fatalf("build payment provider: %v", err)
+	}
+	paymentService := service.NewPaymentService(payments, lots, provider, defaultTestHourlyRate, clock)
+	sessionService := service.NewSessionService(lots, sessions, paymentService, clock, msgNotifier, logger)
 
 	lot, err := lotService.Create(context.Background(), service.CreateLotInput{
 		Name:     "Central Plaza",
@@ -34,6 +52,13 @@ func newServices(t *testing.T) (*service.LotService, *service.SessionService, do
 	if err != nil {
 		t.Fatalf("create lot: %v", err)
 	}
+	return lotService, sessionService, payments, lot
+}
+
+func newServices(t *testing.T) (*service.LotService, *service.SessionService, domain.Lot) {
+	t.Helper()
+
+	lotService, sessionService, _, lot := newHarness(t, nil, nil)
 	return lotService, sessionService, lot
 }
 
@@ -54,25 +79,10 @@ func (n *recordingNotifier) Send(_ context.Context, msg notify.Message) error {
 func newServicesWithNotifier(t *testing.T, notifier notify.Notifier) (*service.SessionService, *bytes.Buffer, domain.Lot) {
 	t.Helper()
 
-	fixed := time.Date(2026, time.November, 17, 9, 0, 0, 0, time.UTC)
-	clock := func() time.Time { return fixed }
-
-	lots := memory.NewLotStore()
-	sessions := memory.NewSessionStore()
-	lotService := service.NewLotService(lots, clock)
-
 	logs := &bytes.Buffer{}
 	logger := slog.New(slog.NewTextHandler(logs, nil))
-	sessionService := service.NewSessionService(lots, sessions, clock, notifier, logger)
 
-	lot, err := lotService.Create(context.Background(), service.CreateLotInput{
-		Name:     "Central Plaza",
-		Address:  "MG Road",
-		Capacity: 1,
-	})
-	if err != nil {
-		t.Fatalf("create lot: %v", err)
-	}
+	_, sessionService, _, lot := newHarness(t, notifier, logger)
 	return sessionService, logs, lot
 }
 
@@ -140,7 +150,7 @@ func TestCheckInStopsWhenLotIsFull(t *testing.T) {
 }
 
 func TestCheckoutTwiceIsAConflict(t *testing.T) {
-	_, sessions, lot := newServices(t)
+	_, sessions, payments, lot := newHarness(t, nil, nil)
 	ctx := context.Background()
 
 	session, err := sessions.CheckIn(ctx, lot.ID, service.CheckInInput{Plate: "KA 01 AB 1234"})
@@ -148,7 +158,7 @@ func TestCheckoutTwiceIsAConflict(t *testing.T) {
 		t.Fatalf("check in: %v", err)
 	}
 
-	checkedOut, err := sessions.Checkout(ctx, session.ID)
+	checkedOut, pending, err := sessions.Checkout(ctx, session.ID)
 	if err != nil {
 		t.Fatalf("checkout: %v", err)
 	}
@@ -158,9 +168,22 @@ func TestCheckoutTwiceIsAConflict(t *testing.T) {
 	if checkedOut.CheckedOutAt == nil {
 		t.Fatal("checkedOutAt is nil")
 	}
+	if pending.Status != domain.PaymentPending {
+		t.Errorf("payment status = %q, want %q", pending.Status, domain.PaymentPending)
+	}
 
-	if _, err := sessions.Checkout(ctx, session.ID); !errors.Is(err, domain.ErrSessionNotActive) {
+	if _, _, err := sessions.Checkout(ctx, session.ID); !errors.Is(err, domain.ErrSessionNotActive) {
 		t.Fatalf("second checkout error = %v, want ErrSessionNotActive", err)
+	}
+
+	// The second checkout is a conflict and never reaches payment creation, so
+	// the session keeps exactly the one payment the first checkout made.
+	stored, err := payments.GetBySession(ctx, session.ID)
+	if err != nil {
+		t.Fatalf("get payment by session: %v", err)
+	}
+	if stored.ID != pending.ID {
+		t.Errorf("payment id = %q, want the only payment %q", stored.ID, pending.ID)
 	}
 }
 
