@@ -40,13 +40,19 @@ Everything is versioned under `/api/v1`. Times are UTC, RFC 3339.
 | `POST` | `/api/v1/lots`                    | create a lot (`name`, `address`, `capacity`)        |
 | `GET`  | `/api/v1/lots`                    | list lots, oldest first                            |
 | `GET`  | `/api/v1/lots/{lotID}`            | read one lot                                       |
-| `POST` | `/api/v1/lots/{lotID}/check-ins`  | check a vehicle in (`plate`, optional `kind`)       |
+| `POST` | `/api/v1/lots/{lotID}/check-ins`  | check a vehicle in (`plate`, optional `kind`, optional `phone`) |
 | `GET`  | `/api/v1/sessions/{sessionID}`    | read one session                                   |
 | `POST` | `/api/v1/sessions/{sessionID}/checkout` | end an active session                        |
 
 `kind` is `STANDARD` (default) or `EV`. Plates are trimmed, internal whitespace is
 collapsed and the value is upper-cased. A plate is 2–15 characters: letters, digits, spaces
 and hyphens.
+
+`phone` is optional and must already be E.164: a `+` followed by 8–15 digits, first digit
+non-zero. Anything else is rejected with `400 VALIDATION_FAILED` before the session is
+created. The number is used only to send the confirmation message described in
+[Notifications](#notifications); it is not stored on the session and not returned in the
+session response.
 
 Example:
 
@@ -59,7 +65,7 @@ curl -s -X POST localhost:8080/api/v1/lots \
 # check in
 curl -s -X POST localhost:8080/api/v1/lots/<lotID>/check-ins \
   -H 'Content-Type: application/json' \
-  -d '{"plate":"ka 01 ab 1234","kind":"EV"}'
+  -d '{"plate":"ka 01 ab 1234","kind":"EV","phone":"+14155550123"}'
 
 # check out
 curl -s -X POST localhost:8080/api/v1/sessions/<sessionID>/checkout
@@ -89,6 +95,27 @@ the same shape as the banking service, plus a stable `code`:
 | `409`  | `SESSION_NOT_ACTIVE` | the session was already checked out                |
 | `500`  | `INTERNAL_ERROR`     | unexpected failure; details are logged, not returned |
 
+### Notifications
+
+A check-in that carries a valid `phone` sends one confirmation SMS once the session exists:
+
+```text
+Checked in to Central Plaza. Plate KA 01 AB 1234. Start 2024-05-01T10:15:00Z.
+```
+
+- The message names the lot, the plate and the session start time in UTC, RFC 3339.
+- The whole body fits one 160-character SMS segment. When a long lot name would push it over,
+  only the lot name is shortened and marked with `...`; the plate and the start time are
+  always kept intact.
+- One best-effort attempt is made after the session is created, before the check-in response
+  is returned, bounded by a short timeout. A provider rejection or timeout is logged with the
+  session id; the check-in still succeeds and the session stays active.
+- A check-in without `phone` sends nothing.
+- Checkout messages, message templates and delivery reports are not implemented.
+- With no Twilio settings — or with any one of them missing — a log-only notifier writes the
+  recipient and the body to the log and nothing is sent, so local development and tests need
+  no Twilio account.
+
 ## Configuration
 
 Every setting has a working default, so the service starts with an empty environment.
@@ -102,6 +129,13 @@ Copy `.env.example` to `.env` only when you need to override something, then exp
 | `HTTP_WRITE_TIMEOUT`     | `10s`   | write timeout                       |
 | `HTTP_IDLE_TIMEOUT`      | `60s`   | keep-alive idle timeout             |
 | `HTTP_SHUTDOWN_TIMEOUT`  | `10s`   | grace period for in-flight requests |
+| `TWILIO_ACCOUNT_SID`     | –       | Twilio account SID for the confirmation SMS |
+| `TWILIO_AUTH_TOKEN`      | –       | Twilio auth token; never logged or printed  |
+| `TWILIO_FROM_NUMBER`     | –       | sender number the confirmation SMS comes from |
+
+The three `TWILIO_*` settings have no defaults and hold no credential in the repository. The
+SMS provider is used only when all three are set; if any one of them is missing, the service
+starts normally on the log-only notifier, which is what local development and tests use.
 
 ## Project layout
 

@@ -1,12 +1,16 @@
 package service_test
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"log/slog"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/techverito/parking-service/internal/domain"
+	"github.com/techverito/parking-service/internal/notify"
 	"github.com/techverito/parking-service/internal/service"
 	"github.com/techverito/parking-service/internal/store/memory"
 )
@@ -20,7 +24,7 @@ func newServices(t *testing.T) (*service.LotService, *service.SessionService, do
 	lots := memory.NewLotStore()
 	sessions := memory.NewSessionStore()
 	lotService := service.NewLotService(lots, clock)
-	sessionService := service.NewSessionService(lots, sessions, clock)
+	sessionService := service.NewSessionService(lots, sessions, clock, nil, nil)
 
 	lot, err := lotService.Create(context.Background(), service.CreateLotInput{
 		Name:     "Central Plaza",
@@ -31,6 +35,45 @@ func newServices(t *testing.T) (*service.LotService, *service.SessionService, do
 		t.Fatalf("create lot: %v", err)
 	}
 	return lotService, sessionService, lot
+}
+
+// recordingNotifier records what the service tries to send and returns the
+// configured error, so notification behaviour is asserted without a provider.
+type recordingNotifier struct {
+	messages []notify.Message
+	err      error
+}
+
+func (n *recordingNotifier) Send(_ context.Context, msg notify.Message) error {
+	n.messages = append(n.messages, msg)
+	return n.err
+}
+
+// newServicesWithNotifier wires the services with the given notifier and an
+// info-level logger writing to the returned buffer.
+func newServicesWithNotifier(t *testing.T, notifier notify.Notifier) (*service.SessionService, *bytes.Buffer, domain.Lot) {
+	t.Helper()
+
+	fixed := time.Date(2026, time.November, 17, 9, 0, 0, 0, time.UTC)
+	clock := func() time.Time { return fixed }
+
+	lots := memory.NewLotStore()
+	sessions := memory.NewSessionStore()
+	lotService := service.NewLotService(lots, clock)
+
+	logs := &bytes.Buffer{}
+	logger := slog.New(slog.NewTextHandler(logs, nil))
+	sessionService := service.NewSessionService(lots, sessions, clock, notifier, logger)
+
+	lot, err := lotService.Create(context.Background(), service.CreateLotInput{
+		Name:     "Central Plaza",
+		Address:  "MG Road",
+		Capacity: 1,
+	})
+	if err != nil {
+		t.Fatalf("create lot: %v", err)
+	}
+	return sessionService, logs, lot
 }
 
 func TestCheckInNormalisesPlateAndDefaultsKind(t *testing.T) {
@@ -146,5 +189,123 @@ func TestCreateLotValidatesInput(t *testing.T) {
 				t.Errorf("field = %q, want %q", validation.Field, tc.field)
 			}
 		})
+	}
+}
+
+func TestCheckInSendsConfirmationWhenPhoneIsPresent(t *testing.T) {
+	notifier := &recordingNotifier{}
+	sessions, _, lot := newServicesWithNotifier(t, notifier)
+
+	if _, err := sessions.CheckIn(context.Background(), lot.ID, service.CheckInInput{
+		Plate: "ka 01 ab 1234",
+		Phone: "+14155550123",
+	}); err != nil {
+		t.Fatalf("check in: %v", err)
+	}
+
+	if len(notifier.messages) != 1 {
+		t.Fatalf("messages = %d, want exactly one", len(notifier.messages))
+	}
+	msg := notifier.messages[0]
+	if msg.To != "+14155550123" {
+		t.Errorf("to = %q, want %q", msg.To, "+14155550123")
+	}
+	want := "Checked in to Central Plaza. Plate KA 01 AB 1234. Start 2026-11-17T09:00:00Z."
+	if msg.Body != want {
+		t.Errorf("body = %q, want %q", msg.Body, want)
+	}
+}
+
+func TestCheckInWithoutPhoneSkipsNotification(t *testing.T) {
+	notifier := &recordingNotifier{}
+	sessions, _, lot := newServicesWithNotifier(t, notifier)
+
+	session, err := sessions.CheckIn(context.Background(), lot.ID, service.CheckInInput{Plate: "KA 01 AB 1234"})
+	if err != nil {
+		t.Fatalf("check in: %v", err)
+	}
+	if session.Status != domain.SessionActive {
+		t.Errorf("status = %q, want %q", session.Status, domain.SessionActive)
+	}
+	if len(notifier.messages) != 0 {
+		t.Errorf("messages = %+v, want none", notifier.messages)
+	}
+}
+
+func TestCheckInRejectsInvalidPhoneBeforeCreatingSession(t *testing.T) {
+	cases := []struct {
+		name  string
+		phone string
+	}{
+		{name: "national format", phone: "0415 555 0123"},
+		{name: "zero after plus", phone: "+0123456789"},
+		{name: "not a number", phone: "abc"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			notifier := &recordingNotifier{}
+			sessions, _, lot := newServicesWithNotifier(t, notifier)
+			ctx := context.Background()
+
+			_, err := sessions.CheckIn(ctx, lot.ID, service.CheckInInput{
+				Plate: "KA 01 AB 1234",
+				Phone: tc.phone,
+			})
+
+			var validation *domain.ValidationError
+			if !errors.As(err, &validation) {
+				t.Fatalf("error = %v, want a ValidationError", err)
+			}
+			if validation.Field != "phone" {
+				t.Errorf("field = %q, want phone", validation.Field)
+			}
+			if len(notifier.messages) != 0 {
+				t.Errorf("messages = %+v, want none", notifier.messages)
+			}
+
+			// The lot holds one vehicle, so a successful check-in proves the
+			// rejected request created no session.
+			session, err := sessions.CheckIn(ctx, lot.ID, service.CheckInInput{Plate: "KA 02 CD 5678"})
+			if err != nil {
+				t.Fatalf("check in after the rejected phone: %v", err)
+			}
+			if session.Status != domain.SessionActive {
+				t.Errorf("status = %q, want %q", session.Status, domain.SessionActive)
+			}
+		})
+	}
+}
+
+func TestCheckInSurvivesNotifierFailure(t *testing.T) {
+	notifier := &recordingNotifier{err: errors.New("twilio rejected the message")}
+	sessions, logs, lot := newServicesWithNotifier(t, notifier)
+	ctx := context.Background()
+
+	session, err := sessions.CheckIn(ctx, lot.ID, service.CheckInInput{
+		Plate: "KA 01 AB 1234",
+		Phone: "+14155550123",
+	})
+	if err != nil {
+		t.Fatalf("check in: %v", err)
+	}
+	if len(notifier.messages) != 1 {
+		t.Fatalf("messages = %d, want exactly one attempt", len(notifier.messages))
+	}
+
+	stored, err := sessions.Get(ctx, session.ID)
+	if err != nil {
+		t.Fatalf("get session: %v", err)
+	}
+	if stored.Status != domain.SessionActive {
+		t.Errorf("status = %q, want %q", stored.Status, domain.SessionActive)
+	}
+
+	logged := logs.String()
+	if !strings.Contains(logged, session.ID) {
+		t.Errorf("log = %q, want the session id", logged)
+	}
+	if !strings.Contains(logged, "twilio rejected the message") {
+		t.Errorf("log = %q, want the notifier error", logged)
 	}
 }

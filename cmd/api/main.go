@@ -12,6 +12,7 @@ import (
 
 	"github.com/techverito/parking-service/internal/config"
 	"github.com/techverito/parking-service/internal/httpapi"
+	"github.com/techverito/parking-service/internal/notify"
 	"github.com/techverito/parking-service/internal/service"
 	"github.com/techverito/parking-service/internal/store/memory"
 )
@@ -23,10 +24,15 @@ func main() {
 
 	lots := memory.NewLotStore()
 	sessions := memory.NewSessionStore()
+	notifier := notify.FromSettings(notify.TwilioSettings{
+		AccountSID: cfg.TwilioAccountSID,
+		AuthToken:  cfg.TwilioAuthToken,
+		FromNumber: cfg.TwilioFromNumber,
+	}, logger)
 
 	server := &http.Server{
 		Addr:              cfg.Addr,
-		Handler:           httpapi.NewRouter(service.NewLotService(lots, time.Now), service.NewSessionService(lots, sessions, time.Now), logger),
+		Handler:           httpapi.NewRouter(service.NewLotService(lots, time.Now), service.NewSessionService(lots, sessions, time.Now, notifier, logger), logger),
 		ReadHeaderTimeout: cfg.ReadTimeout,
 		ReadTimeout:       cfg.ReadTimeout,
 		WriteTimeout:      cfg.WriteTimeout,

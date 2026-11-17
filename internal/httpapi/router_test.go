@@ -2,6 +2,7 @@ package httpapi_test
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"io"
 	"log/slog"
@@ -12,11 +13,20 @@ import (
 	"time"
 
 	"github.com/techverito/parking-service/internal/httpapi"
+	"github.com/techverito/parking-service/internal/notify"
 	"github.com/techverito/parking-service/internal/service"
 	"github.com/techverito/parking-service/internal/store/memory"
 )
 
 func newTestServer(t *testing.T) *httptest.Server {
+	t.Helper()
+
+	return newTestServerWithNotifier(t, nil)
+}
+
+// newTestServerWithNotifier builds the real router with the given notifier, so a
+// test can assert what the service tried to send.
+func newTestServerWithNotifier(t *testing.T, notifier notify.Notifier) *httptest.Server {
 	t.Helper()
 
 	lots := memory.NewLotStore()
@@ -25,11 +35,23 @@ func newTestServer(t *testing.T) *httptest.Server {
 
 	server := httptest.NewServer(httpapi.NewRouter(
 		service.NewLotService(lots, time.Now),
-		service.NewSessionService(lots, sessions, time.Now),
+		service.NewSessionService(lots, sessions, time.Now, notifier, logger),
 		logger,
 	))
 	t.Cleanup(server.Close)
 	return server
+}
+
+// recordingNotifier records the messages the service tried to send so the HTTP
+// tests can assert on them without a provider.
+type recordingNotifier struct {
+	messages []notify.Message
+	err      error
+}
+
+func (n *recordingNotifier) Send(_ context.Context, msg notify.Message) error {
+	n.messages = append(n.messages, msg)
+	return n.err
 }
 
 func request(t *testing.T, server *httptest.Server, method, path string, body any) (*http.Response, []byte) {
@@ -266,5 +288,83 @@ func TestUnknownRoutesReturnProblemJSON(t *testing.T) {
 	}
 	if got := decode[problemBody](t, payload).Code; got != "NOT_FOUND" {
 		t.Errorf("code = %q, want NOT_FOUND", got)
+	}
+}
+
+func TestCheckInWithPhoneSendsConfirmation(t *testing.T) {
+	notifier := &recordingNotifier{}
+	server := newTestServerWithNotifier(t, notifier)
+	lot := createLot(t, server, 1)
+
+	resp, payload := request(t, server, http.MethodPost, "/api/v1/lots/"+lot.ID+"/check-ins", map[string]any{
+		"plate": "KA 01 AB 1234",
+		"phone": "+14155550123",
+	})
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("check-in status = %d, body = %s", resp.StatusCode, payload)
+	}
+
+	var body map[string]json.RawMessage
+	if err := json.Unmarshal(payload, &body); err != nil {
+		t.Fatalf("decode response %q: %v", payload, err)
+	}
+	if _, ok := body["phone"]; ok {
+		t.Errorf("response %s exposes the phone number", payload)
+	}
+
+	if len(notifier.messages) != 1 {
+		t.Fatalf("messages = %d, want exactly one", len(notifier.messages))
+	}
+	msg := notifier.messages[0]
+	if msg.To != "+14155550123" {
+		t.Errorf("to = %q, want the submitted phone", msg.To)
+	}
+	if !strings.Contains(msg.Body, "Central Plaza") || !strings.Contains(msg.Body, "KA 01 AB 1234") {
+		t.Errorf("body = %q, want the lot and the plate", msg.Body)
+	}
+}
+
+func TestCheckInWithoutPhoneSendsNothing(t *testing.T) {
+	notifier := &recordingNotifier{}
+	server := newTestServerWithNotifier(t, notifier)
+	lot := createLot(t, server, 1)
+
+	resp, payload := request(t, server, http.MethodPost, "/api/v1/lots/"+lot.ID+"/check-ins", map[string]any{
+		"plate": "KA 01 AB 1234",
+	})
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("check-in status = %d, body = %s", resp.StatusCode, payload)
+	}
+	if len(notifier.messages) != 0 {
+		t.Errorf("messages = %+v, want none", notifier.messages)
+	}
+}
+
+func TestCheckInRejectsInvalidPhone(t *testing.T) {
+	notifier := &recordingNotifier{}
+	server := newTestServerWithNotifier(t, notifier)
+	lot := createLot(t, server, 1)
+
+	resp, payload := request(t, server, http.MethodPost, "/api/v1/lots/"+lot.ID+"/check-ins", map[string]any{
+		"plate": "KA 01 AB 1234",
+		"phone": "0415 555 0123",
+	})
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400, body = %s", resp.StatusCode, payload)
+	}
+	if got := decode[problemBody](t, payload).Code; got != "VALIDATION_FAILED" {
+		t.Errorf("code = %q, want VALIDATION_FAILED", got)
+	}
+	if len(notifier.messages) != 0 {
+		t.Fatalf("messages = %+v, want none", notifier.messages)
+	}
+
+	// The lot holds one vehicle, so a successful check-in proves the rejected
+	// request created no session.
+	resp, payload = request(t, server, http.MethodPost, "/api/v1/lots/"+lot.ID+"/check-ins", map[string]any{
+		"plate": "KA 02 CD 5678",
+	})
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("check-in after the rejected phone = %d, body = %s", resp.StatusCode, payload)
 	}
 }

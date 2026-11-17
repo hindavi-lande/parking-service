@@ -13,6 +13,7 @@ import (
 type checkInRequest struct {
 	Plate string `json:"plate"`
 	Kind  string `json:"kind"`
+	Phone string `json:"phone"`
 }
 
 type sessionResponse struct {
@@ -47,6 +48,7 @@ func (a *API) checkIn(w http.ResponseWriter, r *http.Request) {
 	session, err := a.sessions.CheckIn(r.Context(), chi.URLParam(r, "lotID"), service.CheckInInput{
 		Plate: request.Plate,
 		Kind:  request.Kind,
+		Phone: request.Phone,
 	})
 	if err != nil {
 		a.fail(w, r, err)

@@ -3,6 +3,8 @@ package service
 import (
 	"context"
 	"fmt"
+	"log/slog"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -10,12 +12,17 @@ import (
 	"unicode/utf8"
 
 	"github.com/techverito/parking-service/internal/domain"
+	"github.com/techverito/parking-service/internal/notify"
 	"github.com/techverito/parking-service/internal/store"
 )
 
 const (
 	minPlateLength = 2
 	maxPlateLength = 15
+
+	// smsTimeout bounds the single best-effort confirmation attempt, so a
+	// hanging provider cannot keep the check-in response open.
+	smsTimeout = 3 * time.Second
 )
 
 // SessionService checks vehicles in and out and enforces lot capacity.
@@ -23,23 +30,34 @@ type SessionService struct {
 	lots     store.LotStore
 	sessions store.SessionStore
 	now      func() time.Time
+	notifier notify.Notifier
+	logger   *slog.Logger
 
 	// checkInMu makes the capacity check and the insert one step while the
 	// in-memory store is in use. A database transaction replaces it.
 	checkInMu sync.Mutex
 }
 
-func NewSessionService(lots store.LotStore, sessions store.SessionStore, now func() time.Time) *SessionService {
+func NewSessionService(lots store.LotStore, sessions store.SessionStore, now func() time.Time, notifier notify.Notifier, logger *slog.Logger) *SessionService {
 	if now == nil {
 		now = time.Now
 	}
-	return &SessionService{lots: lots, sessions: sessions, now: now}
+	if notifier == nil {
+		notifier = notify.NewLogNotifier(slog.Default())
+	}
+	if logger == nil {
+		logger = slog.Default()
+	}
+	return &SessionService{lots: lots, sessions: sessions, now: now, notifier: notifier, logger: logger}
 }
 
 // CheckInInput is the caller-supplied part of a check-in.
 type CheckInInput struct {
 	Plate string
 	Kind  string
+	// Phone is optional. It is used only to send the confirmation and is never
+	// stored on the session; when empty no message is sent.
+	Phone string
 }
 
 func (s *SessionService) CheckIn(ctx context.Context, lotID string, input CheckInInput) (domain.Session, error) {
@@ -51,21 +69,40 @@ func (s *SessionService) CheckIn(ctx context.Context, lotID string, input CheckI
 	if err != nil {
 		return domain.Session{}, err
 	}
+	phone, err := normalizePhone(input.Phone)
+	if err != nil {
+		return domain.Session{}, err
+	}
 
 	lot, err := s.lots.Get(ctx, lotID)
 	if err != nil {
 		return domain.Session{}, fmt.Errorf("get lot %q: %w", lotID, err)
 	}
 
+	session, err := s.createActiveSession(ctx, lot, plate, kind)
+	if err != nil {
+		return domain.Session{}, err
+	}
+
+	if phone != "" {
+		s.sendConfirmation(ctx, phone, lot.Name, session)
+	}
+	return session, nil
+}
+
+// createActiveSession enforces the lot capacity and inserts the session under
+// one lock. The lock is released before the confirmation is sent, so a slow
+// provider cannot block other check-ins.
+func (s *SessionService) createActiveSession(ctx context.Context, lot domain.Lot, plate string, kind domain.SessionKind) (domain.Session, error) {
 	s.checkInMu.Lock()
 	defer s.checkInMu.Unlock()
 
-	active, err := s.sessions.CountActiveByLot(ctx, lotID)
+	active, err := s.sessions.CountActiveByLot(ctx, lot.ID)
 	if err != nil {
-		return domain.Session{}, fmt.Errorf("count active sessions in lot %q: %w", lotID, err)
+		return domain.Session{}, fmt.Errorf("count active sessions in lot %q: %w", lot.ID, err)
 	}
 	if active >= lot.Capacity {
-		return domain.Session{}, fmt.Errorf("lot %q: %w", lotID, domain.ErrLotFull)
+		return domain.Session{}, fmt.Errorf("lot %q: %w", lot.ID, domain.ErrLotFull)
 	}
 
 	session := domain.Session{
@@ -80,6 +117,26 @@ func (s *SessionService) CheckIn(ctx context.Context, lotID string, input CheckI
 		return domain.Session{}, fmt.Errorf("create session: %w", err)
 	}
 	return session, nil
+}
+
+// sendConfirmation makes exactly one best-effort attempt for a session that is
+// already stored. The attempt outlives a client disconnect and is capped by
+// smsTimeout; a failure is logged and never returned, so it cannot fail the
+// check-in.
+func (s *SessionService) sendConfirmation(ctx context.Context, phone, lotName string, session domain.Session) {
+	sendCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), smsTimeout)
+	defer cancel()
+
+	msg := notify.Message{
+		To:   phone,
+		Body: notify.CheckInMessage(lotName, session.Plate, session.CheckedInAt),
+	}
+	if err := s.notifier.Send(sendCtx, msg); err != nil {
+		s.logger.Error("send check-in confirmation",
+			"session_id", session.ID,
+			"error", err,
+		)
+	}
 }
 
 func (s *SessionService) Get(ctx context.Context, id string) (domain.Session, error) {
@@ -131,6 +188,24 @@ func normalizePlate(raw string) (string, error) {
 		}
 	}
 	return plate, nil
+}
+
+// e164Pattern matches a full E.164 number: a leading plus, a non-zero first
+// digit and 8 to 15 digits in total.
+var e164Pattern = regexp.MustCompile(`^\+[1-9][0-9]{1,14}$`)
+
+// normalizePhone trims the optional phone number. An empty value means the
+// caller wants no message; anything else must already be E.164, because
+// national formats are not converted.
+func normalizePhone(raw string) (string, error) {
+	phone := strings.TrimSpace(raw)
+	if phone == "" {
+		return "", nil
+	}
+	if !e164Pattern.MatchString(phone) {
+		return "", &domain.ValidationError{Field: "phone", Message: "must be a valid E.164 number"}
+	}
+	return phone, nil
 }
 
 func normalizeKind(raw string) (domain.SessionKind, error) {
