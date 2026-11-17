@@ -14,6 +14,12 @@ type Config struct {
 	WriteTimeout    time.Duration
 	IdleTimeout     time.Duration
 	ShutdownTimeout time.Duration
+
+	// Twilio settings for the confirmation SMS. Empty means the service uses the
+	// log-only notifier, and no default is ever a real credential.
+	TwilioAccountSID string
+	TwilioAuthToken  string
+	TwilioFromNumber string
 }
 
 // Load reads the configuration, falling back to local-friendly defaults so the
@@ -26,6 +32,10 @@ func Load() Config {
 		WriteTimeout:    durationEnv("HTTP_WRITE_TIMEOUT", 10*time.Second),
 		IdleTimeout:     durationEnv("HTTP_IDLE_TIMEOUT", 60*time.Second),
 		ShutdownTimeout: durationEnv("HTTP_SHUTDOWN_TIMEOUT", 10*time.Second),
+
+		TwilioAccountSID: stringEnv("TWILIO_ACCOUNT_SID", ""),
+		TwilioAuthToken:  stringEnv("TWILIO_AUTH_TOKEN", ""),
+		TwilioFromNumber: stringEnv("TWILIO_FROM_NUMBER", ""),
 	}
 }
 
