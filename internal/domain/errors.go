@@ -1,0 +1,26 @@
+package domain
+
+import (
+	"errors"
+	"fmt"
+)
+
+var (
+	// ErrNotFound means the requested lot or session does not exist.
+	ErrNotFound = errors.New("not found")
+	// ErrLotFull means the lot has no free capacity for another vehicle.
+	ErrLotFull = errors.New("lot is full")
+	// ErrSessionNotActive means the session has already been checked out.
+	ErrSessionNotActive = errors.New("session is not active")
+)
+
+// ValidationError describes a rejected input field. Services return it for
+// values the caller can fix; the HTTP layer maps it to 400.
+type ValidationError struct {
+	Field   string
+	Message string
+}
+
+func (e *ValidationError) Error() string {
+	return fmt.Sprintf("%s %s", e.Field, e.Message)
+}
