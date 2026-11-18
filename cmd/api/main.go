@@ -14,7 +14,7 @@ import (
 	"github.com/techverito/parking-service/internal/config"
 	"github.com/techverito/parking-service/internal/httpapi"
 	"github.com/techverito/parking-service/internal/notify"
-	"github.com/techverito/parking-service/internal/payment"
+	"github.com/techverito/parking-service/internal/payments"
 	"github.com/techverito/parking-service/internal/service"
 	"github.com/techverito/parking-service/internal/store/memory"
 )
@@ -33,20 +33,25 @@ func main() {
 
 	lots := memory.NewLotStore()
 	sessions := memory.NewSessionStore()
-	payments := memory.NewPaymentStore()
+	paymentStore := memory.NewPaymentStore()
 	notifier := notify.FromSettings(notify.TwilioSettings{
 		AccountSID: cfg.TwilioAccountSID,
 		AuthToken:  cfg.TwilioAuthToken,
 		FromNumber: cfg.TwilioFromNumber,
 	}, logger)
 
-	provider, err := payment.FromName(cfg.PaymentProvider)
+	provider, err := payments.FromSettings(payments.Settings{
+		Name:                cfg.PaymentProvider,
+		StripeSecretKey:     cfg.StripeSecretKey,
+		StripeWebhookSecret: cfg.StripeWebhookSecret,
+		StripeBaseURL:       cfg.StripeBaseURL,
+	})
 	if err != nil {
 		logger.Error("select payment provider", "error", err)
 		os.Exit(1)
 	}
 
-	paymentService := service.NewPaymentService(payments, lots, provider, cfg.PaymentHourlyRate, time.Now)
+	paymentService := service.NewPaymentService(paymentStore, lots, provider, cfg.PaymentHourlyRate, time.Now)
 
 	server := &http.Server{
 		Addr: cfg.Addr,

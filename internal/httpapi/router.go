@@ -54,6 +54,9 @@ func NewRouter(lots *service.LotService, sessions *service.SessionService, payme
 		r.Route("/payments", func(r chi.Router) {
 			r.Get("/{paymentID}", api.getPayment)
 			r.Post("/webhooks/{provider}", api.paymentWebhook)
+			// Stripe is told to call this fixed URL, so the provider is not part
+			// of the path.
+			r.Post("/stripe/webhook", api.stripeWebhook)
 		})
 	})
 

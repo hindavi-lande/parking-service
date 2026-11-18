@@ -8,17 +8,20 @@ import (
 )
 
 // PaymentStore keeps at most one payment per session in a map for the lifetime
-// of the process.
+// of the process. It also remembers which provider event ids were handled, so a
+// repeated callback is not applied twice.
 type PaymentStore struct {
 	mu        sync.RWMutex
 	payments  map[string]domain.Payment
 	bySession map[string]string
+	events    map[string]struct{}
 }
 
 func NewPaymentStore() *PaymentStore {
 	return &PaymentStore{
 		payments:  make(map[string]domain.Payment),
 		bySession: make(map[string]string),
+		events:    make(map[string]struct{}),
 	}
 }
 
@@ -69,5 +72,23 @@ func (s *PaymentStore) Update(_ context.Context, payment domain.Payment) error {
 		return domain.ErrNotFound
 	}
 	s.payments[payment.ID] = payment
+	return nil
+}
+
+// IsEventProcessed reports whether the provider event with this id was already
+// handled.
+func (s *PaymentStore) IsEventProcessed(_ context.Context, eventID string) (bool, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	_, ok := s.events[eventID]
+	return ok, nil
+}
+
+// MarkEventProcessed records a provider event id. Marking an id that is already
+// marked is a no-op and returns nil, so a callback can be replayed safely.
+func (s *PaymentStore) MarkEventProcessed(_ context.Context, eventID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.events[eventID] = struct{}{}
 	return nil
 }

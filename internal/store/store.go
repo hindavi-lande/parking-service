@@ -33,4 +33,11 @@ type PaymentStore interface {
 	Get(ctx context.Context, id string) (domain.Payment, error)
 	GetBySession(ctx context.Context, sessionID string) (domain.Payment, error)
 	Update(ctx context.Context, payment domain.Payment) error
+
+	// IsEventProcessed reports whether the provider event with this id was
+	// already handled. It returns false for an id that was never marked.
+	IsEventProcessed(ctx context.Context, eventID string) (bool, error)
+	// MarkEventProcessed records a provider event id so a repeated callback is
+	// handled once. Marking an id that is already marked returns nil.
+	MarkEventProcessed(ctx context.Context, eventID string) error
 }

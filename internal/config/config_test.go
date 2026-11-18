@@ -50,11 +50,111 @@ func TestLoadReadsPaymentSettings(t *testing.T) {
 	}
 
 	t.Setenv("PAYMENT_PROVIDER", "stripe")
+	t.Setenv("STRIPE_SECRET_KEY", "sk_test_config")
+	t.Setenv("STRIPE_WEBHOOK_SECRET", "whsec_config")
 	cfg, err = config.Load()
 	if err != nil {
 		t.Fatalf("load: %v", err)
 	}
 	if cfg.PaymentProvider != "stripe" {
 		t.Errorf("provider = %q, want stripe", cfg.PaymentProvider)
+	}
+}
+
+func TestLoadRequiresStripeSecretsWhenStripeIsSelected(t *testing.T) {
+	cases := []struct {
+		name        string
+		secretKey   string
+		webhookKey  string
+		wantMissing string
+	}{
+		{name: "missing secret key", secretKey: "", webhookKey: "whsec_config", wantMissing: "STRIPE_SECRET_KEY"},
+		{name: "missing webhook secret", secretKey: "sk_test_config", webhookKey: "", wantMissing: "STRIPE_WEBHOOK_SECRET"},
+		{name: "missing both", secretKey: "", webhookKey: "", wantMissing: "STRIPE_SECRET_KEY"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("PAYMENT_HOURLY_RATE", "5000")
+			t.Setenv("PAYMENT_PROVIDER", "  STRIPE ")
+			t.Setenv("STRIPE_SECRET_KEY", tc.secretKey)
+			t.Setenv("STRIPE_WEBHOOK_SECRET", tc.webhookKey)
+
+			_, err := config.Load()
+			if err == nil {
+				t.Fatal("expected a configuration error")
+			}
+			if !strings.Contains(err.Error(), tc.wantMissing) {
+				t.Errorf("error = %v, want it to name %s", err, tc.wantMissing)
+			}
+		})
+	}
+}
+
+func TestLoadNeverEchoesStripeSecrets(t *testing.T) {
+	const secretKey = "sk_test_never_echo_this"
+	const webhookSecret = "whsec_never_echo_this"
+
+	t.Setenv("PAYMENT_HOURLY_RATE", "5000")
+	t.Setenv("PAYMENT_PROVIDER", "stripe")
+	t.Setenv("STRIPE_SECRET_KEY", secretKey)
+	t.Setenv("STRIPE_WEBHOOK_SECRET", webhookSecret)
+
+	if _, err := config.Load(); err != nil {
+		t.Fatalf("load with both secrets: %v", err)
+	}
+
+	// A failing load names the missing variable and neither value.
+	t.Setenv("STRIPE_WEBHOOK_SECRET", "")
+	_, err := config.Load()
+	if err == nil {
+		t.Fatal("expected a configuration error for the missing webhook secret")
+	}
+	if strings.Contains(err.Error(), secretKey) || strings.Contains(err.Error(), webhookSecret) {
+		t.Errorf("error = %v, want neither secret in the message", err)
+	}
+}
+
+func TestLoadReadsStripeSettings(t *testing.T) {
+	t.Setenv("PAYMENT_HOURLY_RATE", "5000")
+	t.Setenv("PAYMENT_PROVIDER", "stripe")
+	t.Setenv("STRIPE_SECRET_KEY", "sk_test_config")
+	t.Setenv("STRIPE_WEBHOOK_SECRET", "whsec_config")
+	t.Setenv("STRIPE_API_BASE_URL", "http://127.0.0.1:12111")
+
+	cfg, err := config.Load()
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if cfg.StripeSecretKey != "sk_test_config" {
+		t.Errorf("secret key = %q, want the configured value", cfg.StripeSecretKey)
+	}
+	if cfg.StripeWebhookSecret != "whsec_config" {
+		t.Errorf("webhook secret = %q, want the configured value", cfg.StripeWebhookSecret)
+	}
+	if cfg.StripeBaseURL != "http://127.0.0.1:12111" {
+		t.Errorf("base url = %q, want the configured value", cfg.StripeBaseURL)
+	}
+}
+
+func TestLoadWithoutStripeSettingsUsesTheFakeProvider(t *testing.T) {
+	t.Setenv("PAYMENT_HOURLY_RATE", "5000")
+	t.Setenv("PAYMENT_PROVIDER", "")
+	t.Setenv("STRIPE_SECRET_KEY", "")
+	t.Setenv("STRIPE_WEBHOOK_SECRET", "")
+	t.Setenv("STRIPE_API_BASE_URL", "")
+
+	cfg, err := config.Load()
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if cfg.PaymentProvider != "fake" {
+		t.Errorf("provider = %q, want the fake default", cfg.PaymentProvider)
+	}
+	if cfg.StripeSecretKey != "" || cfg.StripeWebhookSecret != "" {
+		t.Errorf("stripe settings = %q/%q, want both empty", cfg.StripeSecretKey, cfg.StripeWebhookSecret)
+	}
+	if cfg.StripeBaseURL != "" {
+		t.Errorf("base url = %q, want the empty default", cfg.StripeBaseURL)
 	}
 }

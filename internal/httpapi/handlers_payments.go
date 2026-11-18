@@ -25,19 +25,27 @@ type paymentResponse struct {
 	Status    string    `json:"status"`
 	CreatedAt time.Time `json:"createdAt"`
 	UpdatedAt time.Time `json:"updatedAt"`
+	// ClientSecret and FailureMessage are optional provider details: the first
+	// is the single-use secret the client confirms the payment with, the second
+	// is why a failed payment was declined. Both are omitted when empty, so a
+	// payment from the fake provider keeps its existing shape.
+	ClientSecret   string `json:"clientSecret,omitempty"`
+	FailureMessage string `json:"failureMessage,omitempty"`
 }
 
 func toPaymentResponse(p domain.Payment) paymentResponse {
 	return paymentResponse{
-		ID:        p.ID,
-		SessionID: p.SessionID,
-		LotID:     p.LotID,
-		Amount:    p.Amount,
-		Currency:  p.Currency,
-		Provider:  p.Provider,
-		Status:    string(p.Status),
-		CreatedAt: p.CreatedAt,
-		UpdatedAt: p.UpdatedAt,
+		ID:             p.ID,
+		SessionID:      p.SessionID,
+		LotID:          p.LotID,
+		Amount:         p.Amount,
+		Currency:       p.Currency,
+		Provider:       p.Provider,
+		Status:         string(p.Status),
+		CreatedAt:      p.CreatedAt,
+		UpdatedAt:      p.UpdatedAt,
+		ClientSecret:   p.ClientSecret,
+		FailureMessage: p.FailureMessage,
 	}
 }
 
@@ -68,6 +76,35 @@ func (a *API) paymentWebhook(w http.ResponseWriter, r *http.Request) {
 	}
 
 	settled, err := a.payments.HandleWebhook(r.Context(), chi.URLParam(r, "provider"), payment.WebhookRequest{
+		Body:   body,
+		Header: header,
+	})
+	if err != nil {
+		a.fail(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, toPaymentResponse(settled))
+}
+
+// stripeWebhook handles the callback Stripe is configured to send to the fixed
+// /api/v1/payments/stripe/webhook URL. Like paymentWebhook it reads the body
+// once and passes it on untouched, because the signature is verified over the
+// raw bytes; a signature that does not verify comes back as a validation error
+// and answers 400 without changing anything.
+func (a *API) stripeWebhook(w http.ResponseWriter, r *http.Request) {
+	r.Body = http.MaxBytesReader(w, r.Body, maxRequestBodyBytes)
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		a.badRequest(w, r, fmt.Errorf("invalid request body: %w", err))
+		return
+	}
+
+	header := make(map[string]string, len(r.Header))
+	for name, values := range r.Header {
+		header[strings.ToLower(name)] = strings.Join(values, ", ")
+	}
+
+	settled, err := a.payments.HandleStripeWebhook(r.Context(), payment.WebhookRequest{
 		Body:   body,
 		Header: header,
 	})

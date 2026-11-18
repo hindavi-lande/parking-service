@@ -2,38 +2,32 @@ package payment_test
 
 import (
 	"context"
-	"strings"
 	"testing"
 
 	"github.com/techverito/parking-service/internal/domain"
 	"github.com/techverito/parking-service/internal/payment"
 )
 
-func TestFromNameSelectsTheFakeProvider(t *testing.T) {
-	provider, err := payment.FromName("fake")
-	if err != nil {
-		t.Fatalf("from name: %v", err)
-	}
-	if got := provider.Name(); got != payment.FakeProviderName {
-		t.Errorf("name = %q, want %q", got, payment.FakeProviderName)
-	}
-}
+func TestFakeProviderCreatesPaymentWithoutClientSecret(t *testing.T) {
+	provider := payment.NewFakeProvider(nil)
 
-func TestFromNameRejectsUnknownProvider(t *testing.T) {
-	provider, err := payment.FromName("stripe")
-	if err == nil {
-		t.Fatalf("provider = %v, want an error for an unknown provider", provider)
+	result, err := provider.CreatePayment(context.Background(), payment.CreateRequest{
+		PaymentID: "pay_1",
+		SessionID: "ses_1",
+		LotID:     "lot_1",
+		Amount:    5000,
+		Currency:  domain.CurrencyINR,
+	})
+	if err != nil {
+		t.Fatalf("create payment: %v", err)
 	}
-	if !strings.Contains(err.Error(), "stripe") {
-		t.Errorf("error = %v, want it to name the unknown provider", err)
+	if result.ClientSecret != "" {
+		t.Errorf("client secret = %q, want none from the fake provider", result.ClientSecret)
 	}
 }
 
 func TestFakeProviderParsesWebhook(t *testing.T) {
-	provider, err := payment.FromName(payment.FakeProviderName)
-	if err != nil {
-		t.Fatalf("from name: %v", err)
-	}
+	provider := payment.NewFakeProvider(nil)
 
 	event, err := provider.ParseWebhook(context.Background(), payment.WebhookRequest{
 		Body: []byte(`{"paymentId":"pay_1","status":"PAID"}`),

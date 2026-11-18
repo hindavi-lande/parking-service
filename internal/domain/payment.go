@@ -32,6 +32,14 @@ type Payment struct {
 	Currency  string
 	Provider  string
 	Status    PaymentStatus
-	CreatedAt time.Time
-	UpdatedAt time.Time
+	// FailureMessage is the provider's human-readable reason for a declined
+	// payment. It is set only when Status becomes FAILED and is empty
+	// otherwise.
+	FailureMessage string
+	// ClientSecret is the single-use credential the client confirms the payment
+	// with. It is never logged and is cleared once the payment reaches a
+	// terminal status.
+	ClientSecret string
+	CreatedAt    time.Time
+	UpdatedAt    time.Time
 }
