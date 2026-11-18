@@ -17,18 +17,19 @@ const requestTimeout = 10 * time.Second
 type API struct {
 	lots     *service.LotService
 	sessions *service.SessionService
+	payments *service.PaymentService
 	logger   *slog.Logger
 }
 
 // NewRouter builds the chi router with the same cross-cutting behaviour as the
 // banking service: request ids, recovery, timeouts, structured logging and
 // problem+json errors for every failure.
-func NewRouter(lots *service.LotService, sessions *service.SessionService, logger *slog.Logger) http.Handler {
+func NewRouter(lots *service.LotService, sessions *service.SessionService, payments *service.PaymentService, logger *slog.Logger) http.Handler {
 	if logger == nil {
 		logger = slog.Default()
 	}
 
-	api := &API{lots: lots, sessions: sessions, logger: logger}
+	api := &API{lots: lots, sessions: sessions, payments: payments, logger: logger}
 
 	router := chi.NewRouter()
 	router.Use(middleware.RequestID)
@@ -49,6 +50,10 @@ func NewRouter(lots *service.LotService, sessions *service.SessionService, logge
 		r.Route("/sessions", func(r chi.Router) {
 			r.Get("/{sessionID}", api.getSession)
 			r.Post("/{sessionID}/checkout", api.checkout)
+		})
+		r.Route("/payments", func(r chi.Router) {
+			r.Get("/{paymentID}", api.getPayment)
+			r.Post("/webhooks/{provider}", api.paymentWebhook)
 		})
 	})
 

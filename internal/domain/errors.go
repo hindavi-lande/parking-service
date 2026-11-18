@@ -12,6 +12,11 @@ var (
 	ErrLotFull = errors.New("lot is full")
 	// ErrSessionNotActive means the session has already been checked out.
 	ErrSessionNotActive = errors.New("session is not active")
+	// ErrPaymentNotPending means the payment already reached a terminal status
+	// and cannot change again.
+	ErrPaymentNotPending = errors.New("payment is not pending")
+	// ErrPaymentExists means the session already has a payment.
+	ErrPaymentExists = errors.New("payment already exists for session")
 )
 
 // ValidationError describes a rejected input field. Services return it for

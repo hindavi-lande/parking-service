@@ -11,26 +11,29 @@ import (
 )
 
 type createLotRequest struct {
-	Name     string `json:"name"`
-	Address  string `json:"address"`
-	Capacity int    `json:"capacity"`
+	Name       string `json:"name"`
+	Address    string `json:"address"`
+	Capacity   int    `json:"capacity"`
+	HourlyRate *int   `json:"hourlyRate"`
 }
 
 type lotResponse struct {
-	ID        string    `json:"id"`
-	Name      string    `json:"name"`
-	Address   string    `json:"address"`
-	Capacity  int       `json:"capacity"`
-	CreatedAt time.Time `json:"createdAt"`
+	ID         string    `json:"id"`
+	Name       string    `json:"name"`
+	Address    string    `json:"address"`
+	Capacity   int       `json:"capacity"`
+	HourlyRate *int      `json:"hourlyRate"`
+	CreatedAt  time.Time `json:"createdAt"`
 }
 
 func toLotResponse(lot domain.Lot) lotResponse {
 	return lotResponse{
-		ID:        lot.ID,
-		Name:      lot.Name,
-		Address:   lot.Address,
-		Capacity:  lot.Capacity,
-		CreatedAt: lot.CreatedAt,
+		ID:         lot.ID,
+		Name:       lot.Name,
+		Address:    lot.Address,
+		Capacity:   lot.Capacity,
+		HourlyRate: lot.HourlyRate,
+		CreatedAt:  lot.CreatedAt,
 	}
 }
 
@@ -42,9 +45,10 @@ func (a *API) createLot(w http.ResponseWriter, r *http.Request) {
 	}
 
 	lot, err := a.lots.Create(r.Context(), service.CreateLotInput{
-		Name:     request.Name,
-		Address:  request.Address,
-		Capacity: request.Capacity,
+		Name:       request.Name,
+		Address:    request.Address,
+		Capacity:   request.Capacity,
+		HourlyRate: request.HourlyRate,
 	})
 	if err != nil {
 		a.fail(w, r, err)

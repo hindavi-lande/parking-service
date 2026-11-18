@@ -24,6 +24,8 @@ type sessionResponse struct {
 	Status       string     `json:"status"`
 	CheckedInAt  time.Time  `json:"checkedInAt"`
 	CheckedOutAt *time.Time `json:"checkedOutAt,omitempty"`
+	// Payment is set only by checkout, so reading a session keeps its body.
+	Payment *paymentResponse `json:"payment,omitempty"`
 }
 
 func toSessionResponse(session domain.Session) sessionResponse {
@@ -69,10 +71,14 @@ func (a *API) getSession(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *API) checkout(w http.ResponseWriter, r *http.Request) {
-	session, err := a.sessions.Checkout(r.Context(), chi.URLParam(r, "sessionID"))
+	session, created, err := a.sessions.Checkout(r.Context(), chi.URLParam(r, "sessionID"))
 	if err != nil {
 		a.fail(w, r, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, toSessionResponse(session))
+
+	response := toSessionResponse(session)
+	payment := toPaymentResponse(created)
+	response.Payment = &payment
+	writeJSON(w, http.StatusOK, response)
 }

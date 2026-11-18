@@ -32,6 +32,9 @@ type CreateLotInput struct {
 	Name     string
 	Address  string
 	Capacity int
+	// HourlyRate is optional. A nil value means the configured default rate
+	// applies; zero is a valid rate and means free parking.
+	HourlyRate *int
 }
 
 func (s *LotService) Create(ctx context.Context, input CreateLotInput) (domain.Lot, error) {
@@ -49,13 +52,25 @@ func (s *LotService) Create(ctx context.Context, input CreateLotInput) (domain.L
 			Message: fmt.Sprintf("must be between 1 and %d", maxLotCapacity),
 		}
 	}
+	if input.HourlyRate != nil && *input.HourlyRate < 0 {
+		return domain.Lot{}, &domain.ValidationError{Field: "hourlyRate", Message: "must not be negative"}
+	}
+
+	// The rate is copied so a caller cannot change a stored lot through the
+	// pointer it passed in.
+	var hourlyRate *int
+	if input.HourlyRate != nil {
+		rate := *input.HourlyRate
+		hourlyRate = &rate
+	}
 
 	lot := domain.Lot{
-		ID:        newID(),
-		Name:      name,
-		Address:   address,
-		Capacity:  input.Capacity,
-		CreatedAt: s.now().UTC(),
+		ID:         newID(),
+		Name:       name,
+		Address:    address,
+		Capacity:   input.Capacity,
+		HourlyRate: hourlyRate,
+		CreatedAt:  s.now().UTC(),
 	}
 	if err := s.lots.Create(ctx, lot); err != nil {
 		return domain.Lot{}, fmt.Errorf("create lot: %w", err)

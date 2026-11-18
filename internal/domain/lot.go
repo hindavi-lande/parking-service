@@ -6,9 +6,13 @@ import "time"
 
 // Lot is a physical parking location with a fixed number of spaces.
 type Lot struct {
-	ID        string
-	Name      string
-	Address   string
-	Capacity  int
-	CreatedAt time.Time
+	ID       string
+	Name     string
+	Address  string
+	Capacity int
+	// HourlyRate is the rate in minor units the operator set on the lot. A nil
+	// value means the configured default rate applies; zero is a valid rate and
+	// means free parking.
+	HourlyRate *int
+	CreatedAt  time.Time
 }

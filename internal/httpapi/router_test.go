@@ -14,9 +14,15 @@ import (
 
 	"github.com/techverito/parking-service/internal/httpapi"
 	"github.com/techverito/parking-service/internal/notify"
+	"github.com/techverito/parking-service/internal/payment"
 	"github.com/techverito/parking-service/internal/service"
 	"github.com/techverito/parking-service/internal/store/memory"
 )
+
+// testHourlyRate is the PAYMENT_HOURLY_RATE the test router is wired with, in
+// minor units. Check-ins and checkouts happen within the same second in these
+// tests, so a stay is billed the one-hour minimum.
+const testHourlyRate = 5000
 
 func newTestServer(t *testing.T) *httptest.Server {
 	t.Helper()
@@ -29,17 +35,34 @@ func newTestServer(t *testing.T) *httptest.Server {
 func newTestServerWithNotifier(t *testing.T, notifier notify.Notifier) *httptest.Server {
 	t.Helper()
 
+	server, _ := newTestServerWithStores(t, notifier)
+	return server
+}
+
+// newTestServerWithStores builds the real router and returns the payment store
+// too, so a test can assert which payments a session received.
+func newTestServerWithStores(t *testing.T, notifier notify.Notifier) (*httptest.Server, *memory.PaymentStore) {
+	t.Helper()
+
 	lots := memory.NewLotStore()
 	sessions := memory.NewSessionStore()
+	payments := memory.NewPaymentStore()
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	provider, err := payment.FromName(payment.FakeProviderName)
+	if err != nil {
+		t.Fatalf("build payment provider: %v", err)
+	}
+	paymentService := service.NewPaymentService(payments, lots, provider, testHourlyRate, time.Now)
 
 	server := httptest.NewServer(httpapi.NewRouter(
 		service.NewLotService(lots, time.Now),
-		service.NewSessionService(lots, sessions, time.Now, notifier, logger),
+		service.NewSessionService(lots, sessions, paymentService, time.Now, notifier, logger),
+		paymentService,
 		logger,
 	))
 	t.Cleanup(server.Close)
-	return server
+	return server, payments
 }
 
 // recordingNotifier records the messages the service tried to send so the HTTP
@@ -97,21 +120,35 @@ func decode[T any](t *testing.T, payload []byte) T {
 }
 
 type lotBody struct {
-	ID        string    `json:"id"`
-	Name      string    `json:"name"`
-	Address   string    `json:"address"`
-	Capacity  int       `json:"capacity"`
-	CreatedAt time.Time `json:"createdAt"`
+	ID         string    `json:"id"`
+	Name       string    `json:"name"`
+	Address    string    `json:"address"`
+	Capacity   int       `json:"capacity"`
+	HourlyRate *int      `json:"hourlyRate"`
+	CreatedAt  time.Time `json:"createdAt"`
 }
 
 type sessionBody struct {
-	ID           string     `json:"id"`
-	LotID        string     `json:"lotId"`
-	Plate        string     `json:"plate"`
-	Kind         string     `json:"kind"`
-	Status       string     `json:"status"`
-	CheckedInAt  time.Time  `json:"checkedInAt"`
-	CheckedOutAt *time.Time `json:"checkedOutAt"`
+	ID           string       `json:"id"`
+	LotID        string       `json:"lotId"`
+	Plate        string       `json:"plate"`
+	Kind         string       `json:"kind"`
+	Status       string       `json:"status"`
+	CheckedInAt  time.Time    `json:"checkedInAt"`
+	CheckedOutAt *time.Time   `json:"checkedOutAt"`
+	Payment      *paymentBody `json:"payment"`
+}
+
+type paymentBody struct {
+	ID        string    `json:"id"`
+	SessionID string    `json:"sessionId"`
+	LotID     string    `json:"lotId"`
+	Amount    int64     `json:"amount"`
+	Currency  string    `json:"currency"`
+	Provider  string    `json:"provider"`
+	Status    string    `json:"status"`
+	CreatedAt time.Time `json:"createdAt"`
+	UpdatedAt time.Time `json:"updatedAt"`
 }
 
 type problemBody struct {
@@ -135,6 +172,34 @@ func createLot(t *testing.T, server *httptest.Server, capacity int) lotBody {
 		t.Fatalf("create lot status = %d, body = %s", resp.StatusCode, payload)
 	}
 	return decode[lotBody](t, payload)
+}
+
+// checkInVehicle parks one vehicle in the lot and returns the created session.
+func checkInVehicle(t *testing.T, server *httptest.Server, lotID, plate string) sessionBody {
+	t.Helper()
+
+	resp, payload := request(t, server, http.MethodPost, "/api/v1/lots/"+lotID+"/check-ins", map[string]any{
+		"plate": plate,
+	})
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("check-in status = %d, body = %s", resp.StatusCode, payload)
+	}
+	return decode[sessionBody](t, payload)
+}
+
+// checkoutAndPay creates a lot, parks one vehicle and checks it out, returning
+// the lot and the checkout response with its payment.
+func checkoutAndPay(t *testing.T, server *httptest.Server, capacity int) (lotBody, sessionBody) {
+	t.Helper()
+
+	lot := createLot(t, server, capacity)
+	session := checkInVehicle(t, server, lot.ID, "KA 01 AB 1234")
+
+	resp, payload := request(t, server, http.MethodPost, "/api/v1/sessions/"+session.ID+"/checkout", nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("checkout status = %d, body = %s", resp.StatusCode, payload)
+	}
+	return lot, decode[sessionBody](t, payload)
 }
 
 func TestHealth(t *testing.T) {
@@ -178,6 +243,102 @@ func TestCreateListAndGetLot(t *testing.T) {
 	}
 	if got := decode[lotBody](t, payload); got.ID != lot.ID {
 		t.Errorf("lot id = %q, want %q", got.ID, lot.ID)
+	}
+}
+
+func TestCreateLotWithHourlyRate(t *testing.T) {
+	server := newTestServer(t)
+
+	resp, payload := request(t, server, http.MethodPost, "/api/v1/lots", map[string]any{
+		"name":       "Central Plaza",
+		"address":    "MG Road",
+		"capacity":   2,
+		"hourlyRate": 5000,
+	})
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("create lot status = %d, body = %s", resp.StatusCode, payload)
+	}
+	lot := decode[lotBody](t, payload)
+	if lot.HourlyRate == nil || *lot.HourlyRate != 5000 {
+		t.Fatalf("hourlyRate = %v, want 5000", lot.HourlyRate)
+	}
+
+	resp, payload = request(t, server, http.MethodGet, "/api/v1/lots/"+lot.ID, nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("get status = %d, want 200", resp.StatusCode)
+	}
+	if got := decode[lotBody](t, payload); got.HourlyRate == nil || *got.HourlyRate != 5000 {
+		t.Errorf("get hourlyRate = %v, want 5000", got.HourlyRate)
+	}
+
+	resp, payload = request(t, server, http.MethodGet, "/api/v1/lots", nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("list status = %d, want 200", resp.StatusCode)
+	}
+	lots := decode[[]lotBody](t, payload)
+	if len(lots) != 1 || lots[0].HourlyRate == nil || *lots[0].HourlyRate != 5000 {
+		t.Errorf("lots = %+v, want the created lot with its rate", lots)
+	}
+
+	// A lot created without a rate carries an explicit null.
+	resp, payload = request(t, server, http.MethodPost, "/api/v1/lots", map[string]any{
+		"name":     "Free Plaza",
+		"address":  "MG Road",
+		"capacity": 1,
+	})
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("create lot without a rate status = %d, body = %s", resp.StatusCode, payload)
+	}
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(payload, &raw); err != nil {
+		t.Fatalf("decode response %q: %v", payload, err)
+	}
+	value, ok := raw["hourlyRate"]
+	if !ok {
+		t.Fatalf("response %s has no hourlyRate", payload)
+	}
+	if string(value) != "null" {
+		t.Errorf("hourlyRate = %s, want null", value)
+	}
+
+	// Zero is a valid rate and means free parking.
+	resp, payload = request(t, server, http.MethodPost, "/api/v1/lots", map[string]any{
+		"name":       "Zero Plaza",
+		"address":    "MG Road",
+		"capacity":   1,
+		"hourlyRate": 0,
+	})
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("create lot with a zero rate status = %d, body = %s", resp.StatusCode, payload)
+	}
+	if free := decode[lotBody](t, payload); free.HourlyRate == nil || *free.HourlyRate != 0 {
+		t.Errorf("hourlyRate = %v, want 0", free.HourlyRate)
+	}
+
+	// A negative rate is rejected and stores nothing.
+	resp, payload = request(t, server, http.MethodPost, "/api/v1/lots", map[string]any{
+		"name":       "Negative Plaza",
+		"address":    "MG Road",
+		"capacity":   1,
+		"hourlyRate": -1,
+	})
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("negative rate status = %d, want 400, body = %s", resp.StatusCode, payload)
+	}
+	body := decode[problemBody](t, payload)
+	if body.Code != "VALIDATION_FAILED" {
+		t.Errorf("code = %q, want VALIDATION_FAILED", body.Code)
+	}
+	if !strings.Contains(body.Detail, "hourlyRate") {
+		t.Errorf("detail = %q, want it to name hourlyRate", body.Detail)
+	}
+
+	resp, payload = request(t, server, http.MethodGet, "/api/v1/lots", nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("list status = %d, want 200", resp.StatusCode)
+	}
+	if lots = decode[[]lotBody](t, payload); len(lots) != 3 {
+		t.Errorf("lots = %d, want the three accepted lots", len(lots))
 	}
 }
 
@@ -366,5 +527,171 @@ func TestCheckInRejectsInvalidPhone(t *testing.T) {
 	})
 	if resp.StatusCode != http.StatusCreated {
 		t.Fatalf("check-in after the rejected phone = %d, body = %s", resp.StatusCode, payload)
+	}
+}
+
+func TestCheckoutReturnsPendingPayment(t *testing.T) {
+	server := newTestServer(t)
+	lot, session := checkoutAndPay(t, server, 1)
+
+	if session.Payment == nil {
+		t.Fatalf("checkout response %+v has no payment", session)
+	}
+	created := *session.Payment
+	if created.SessionID != session.ID || created.LotID != lot.ID {
+		t.Errorf("payment = %+v, want the session %q and lot %q", created, session.ID, lot.ID)
+	}
+	if created.Amount != testHourlyRate {
+		t.Errorf("amount = %d, want the one-hour minimum %d", created.Amount, testHourlyRate)
+	}
+	if created.Currency != "INR" {
+		t.Errorf("currency = %q, want INR", created.Currency)
+	}
+	if created.Provider != payment.FakeProviderName {
+		t.Errorf("provider = %q, want %q", created.Provider, payment.FakeProviderName)
+	}
+	if created.Status != "PENDING" {
+		t.Errorf("status = %q, want PENDING", created.Status)
+	}
+
+	// Reading the session keeps its body: only checkout carries the payment.
+	resp, payload := request(t, server, http.MethodGet, "/api/v1/sessions/"+session.ID, nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("get session status = %d, want 200", resp.StatusCode)
+	}
+	var body map[string]json.RawMessage
+	if err := json.Unmarshal(payload, &body); err != nil {
+		t.Fatalf("decode response %q: %v", payload, err)
+	}
+	if _, ok := body["payment"]; ok {
+		t.Errorf("get session response %s carries a payment", payload)
+	}
+}
+
+func TestGetPaymentReturnsStatusAndTimestamps(t *testing.T) {
+	server := newTestServer(t)
+	_, session := checkoutAndPay(t, server, 1)
+	if session.Payment == nil {
+		t.Fatalf("checkout response %+v has no payment", session)
+	}
+
+	resp, payload := request(t, server, http.MethodGet, "/api/v1/payments/"+session.Payment.ID, nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("get payment status = %d, body = %s", resp.StatusCode, payload)
+	}
+	stored := decode[paymentBody](t, payload)
+	if stored.ID != session.Payment.ID {
+		t.Errorf("payment id = %q, want %q", stored.ID, session.Payment.ID)
+	}
+	if stored.Status != "PENDING" {
+		t.Errorf("status = %q, want PENDING", stored.Status)
+	}
+	if stored.Amount != testHourlyRate || stored.Currency != "INR" {
+		t.Errorf("payment = %+v, want %d minor units of INR", stored, testHourlyRate)
+	}
+	if stored.CreatedAt.IsZero() || stored.UpdatedAt.IsZero() {
+		t.Errorf("payment = %+v, want both timestamps", stored)
+	}
+
+	resp, payload = request(t, server, http.MethodGet, "/api/v1/payments/missing", nil)
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("unknown payment status = %d, want 404, body = %s", resp.StatusCode, payload)
+	}
+	if got := decode[problemBody](t, payload).Code; got != "NOT_FOUND" {
+		t.Errorf("code = %q, want NOT_FOUND", got)
+	}
+}
+
+func TestWebhookMovesPaymentToPaidThenConflicts(t *testing.T) {
+	server := newTestServer(t)
+	_, session := checkoutAndPay(t, server, 1)
+	if session.Payment == nil {
+		t.Fatalf("checkout response %+v has no payment", session)
+	}
+
+	resp, payload := request(t, server, http.MethodPost, "/api/v1/payments/webhooks/"+payment.FakeProviderName, map[string]any{
+		"paymentId": session.Payment.ID,
+		"status":    "PAID",
+	})
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("webhook status = %d, body = %s", resp.StatusCode, payload)
+	}
+	if paid := decode[paymentBody](t, payload); paid.Status != "PAID" {
+		t.Errorf("status = %q, want PAID", paid.Status)
+	}
+
+	resp, payload = request(t, server, http.MethodPost, "/api/v1/payments/webhooks/"+payment.FakeProviderName, map[string]any{
+		"paymentId": session.Payment.ID,
+		"status":    "FAILED",
+	})
+	if resp.StatusCode != http.StatusConflict {
+		t.Fatalf("second webhook status = %d, want 409, body = %s", resp.StatusCode, payload)
+	}
+	body := decode[problemBody](t, payload)
+	if body.Code != "PAYMENT_NOT_PENDING" {
+		t.Errorf("code = %q, want PAYMENT_NOT_PENDING", body.Code)
+	}
+	if body.Type == "" || body.Title == "" || body.Detail == "" || body.Status != http.StatusConflict {
+		t.Errorf("problem = %+v, want the full problem+json envelope", body)
+	}
+	if body.Instance != "/api/v1/payments/webhooks/"+payment.FakeProviderName {
+		t.Errorf("instance = %q, want the webhook path", body.Instance)
+	}
+	if contentType := resp.Header.Get("Content-Type"); !strings.HasPrefix(contentType, "application/problem+json") {
+		t.Errorf("Content-Type = %q, want application/problem+json", contentType)
+	}
+}
+
+func TestWebhookRejectsUnknownProvider(t *testing.T) {
+	server := newTestServer(t)
+	_, session := checkoutAndPay(t, server, 1)
+	if session.Payment == nil {
+		t.Fatalf("checkout response %+v has no payment", session)
+	}
+
+	resp, payload := request(t, server, http.MethodPost, "/api/v1/payments/webhooks/other", map[string]any{
+		"paymentId": session.Payment.ID,
+		"status":    "PAID",
+	})
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400, body = %s", resp.StatusCode, payload)
+	}
+	if got := decode[problemBody](t, payload).Code; got != "VALIDATION_FAILED" {
+		t.Errorf("code = %q, want VALIDATION_FAILED", got)
+	}
+}
+
+func TestCheckoutTwiceReturnsOnePayment(t *testing.T) {
+	server, payments := newTestServerWithStores(t, nil)
+	ctx := context.Background()
+
+	lot := createLot(t, server, 1)
+	session := checkInVehicle(t, server, lot.ID, "KA 01 AB 1234")
+
+	resp, payload := request(t, server, http.MethodPost, "/api/v1/sessions/"+session.ID+"/checkout", nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("checkout status = %d, body = %s", resp.StatusCode, payload)
+	}
+	first := decode[sessionBody](t, payload)
+	if first.Payment == nil {
+		t.Fatalf("checkout response %+v has no payment", first)
+	}
+
+	resp, payload = request(t, server, http.MethodPost, "/api/v1/sessions/"+session.ID+"/checkout", nil)
+	if resp.StatusCode != http.StatusConflict {
+		t.Fatalf("second checkout status = %d, want 409, body = %s", resp.StatusCode, payload)
+	}
+	if got := decode[problemBody](t, payload).Code; got != "SESSION_NOT_ACTIVE" {
+		t.Errorf("code = %q, want SESSION_NOT_ACTIVE", got)
+	}
+
+	// The second checkout is a conflict and never reaches payment creation, so
+	// the session keeps exactly the one payment the first checkout made.
+	stored, err := payments.GetBySession(ctx, session.ID)
+	if err != nil {
+		t.Fatalf("get payment by session: %v", err)
+	}
+	if stored.ID != first.Payment.ID {
+		t.Errorf("payment id = %q, want the only payment %q", stored.ID, first.Payment.ID)
 	}
 }

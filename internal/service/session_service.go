@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"regexp"
@@ -25,10 +26,17 @@ const (
 	smsTimeout = 3 * time.Second
 )
 
+// checkoutPayments is the narrow slice of the payment service a checkout needs.
+// It stays an interface so the session flow can be exercised on its own.
+type checkoutPayments interface {
+	CreateForCheckout(ctx context.Context, session domain.Session) (domain.Payment, error)
+}
+
 // SessionService checks vehicles in and out and enforces lot capacity.
 type SessionService struct {
 	lots     store.LotStore
 	sessions store.SessionStore
+	payments checkoutPayments
 	now      func() time.Time
 	notifier notify.Notifier
 	logger   *slog.Logger
@@ -38,7 +46,7 @@ type SessionService struct {
 	checkInMu sync.Mutex
 }
 
-func NewSessionService(lots store.LotStore, sessions store.SessionStore, now func() time.Time, notifier notify.Notifier, logger *slog.Logger) *SessionService {
+func NewSessionService(lots store.LotStore, sessions store.SessionStore, payments checkoutPayments, now func() time.Time, notifier notify.Notifier, logger *slog.Logger) *SessionService {
 	if now == nil {
 		now = time.Now
 	}
@@ -48,7 +56,7 @@ func NewSessionService(lots store.LotStore, sessions store.SessionStore, now fun
 	if logger == nil {
 		logger = slog.Default()
 	}
-	return &SessionService{lots: lots, sessions: sessions, now: now, notifier: notifier, logger: logger}
+	return &SessionService{lots: lots, sessions: sessions, payments: payments, now: now, notifier: notifier, logger: logger}
 }
 
 // CheckInInput is the caller-supplied part of a check-in.
@@ -147,25 +155,37 @@ func (s *SessionService) Get(ctx context.Context, id string) (domain.Session, er
 	return session, nil
 }
 
-// Checkout ends an active session. Checking out twice is a conflict, not a
-// silent success, so a retried request cannot extend a stay.
-func (s *SessionService) Checkout(ctx context.Context, id string) (domain.Session, error) {
+// Checkout ends an active session and returns it together with its payment.
+// Checking out twice is a conflict, not a silent success, so a retried request
+// can neither extend a stay nor charge again. The payment is created before the
+// session is written, so a pricing or provider failure leaves the stored session
+// active and the caller can retry.
+func (s *SessionService) Checkout(ctx context.Context, id string) (domain.Session, domain.Payment, error) {
+	if s.payments == nil {
+		return domain.Session{}, domain.Payment{}, errors.New("checkout: no payment service configured")
+	}
+
 	session, err := s.sessions.Get(ctx, id)
 	if err != nil {
-		return domain.Session{}, fmt.Errorf("get session %q: %w", id, err)
+		return domain.Session{}, domain.Payment{}, fmt.Errorf("get session %q: %w", id, err)
 	}
 	if session.Status != domain.SessionActive {
-		return domain.Session{}, fmt.Errorf("session %q: %w", id, domain.ErrSessionNotActive)
+		return domain.Session{}, domain.Payment{}, fmt.Errorf("session %q: %w", id, domain.ErrSessionNotActive)
 	}
 
 	checkedOutAt := s.now().UTC()
 	session.Status = domain.SessionCheckedOut
 	session.CheckedOutAt = &checkedOutAt
 
-	if err := s.sessions.Update(ctx, session); err != nil {
-		return domain.Session{}, fmt.Errorf("update session %q: %w", id, err)
+	created, err := s.payments.CreateForCheckout(ctx, session)
+	if err != nil {
+		return domain.Session{}, domain.Payment{}, err
 	}
-	return session, nil
+
+	if err := s.sessions.Update(ctx, session); err != nil {
+		return domain.Session{}, domain.Payment{}, fmt.Errorf("update session %q: %w", id, err)
+	}
+	return session, created, nil
 }
 
 func normalizePlate(raw string) (string, error) {

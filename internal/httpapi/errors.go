@@ -26,6 +26,8 @@ func (a *API) fail(w http.ResponseWriter, r *http.Request, err error) {
 		writeProblem(w, r, http.StatusConflict, "LOT_FULL", "The lot has no free capacity.")
 	case errors.Is(err, domain.ErrSessionNotActive):
 		writeProblem(w, r, http.StatusConflict, "SESSION_NOT_ACTIVE", "The session has already been checked out.")
+	case errors.Is(err, domain.ErrPaymentNotPending):
+		writeProblem(w, r, http.StatusConflict, "PAYMENT_NOT_PENDING", "The payment has already reached a final status.")
 	default:
 		a.logger.Error("request failed",
 			"error", err,

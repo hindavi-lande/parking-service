@@ -7,32 +7,55 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
 	"github.com/techverito/parking-service/internal/config"
 	"github.com/techverito/parking-service/internal/httpapi"
 	"github.com/techverito/parking-service/internal/notify"
+	"github.com/techverito/parking-service/internal/payment"
 	"github.com/techverito/parking-service/internal/service"
 	"github.com/techverito/parking-service/internal/store/memory"
 )
 
 func main() {
-	cfg := config.Load()
+	loadDotEnv(".env")
+
+	cfg, err := config.Load()
+	if err != nil {
+		slog.Default().Error("load configuration", "error", err)
+		os.Exit(1)
+	}
+
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
 	slog.SetDefault(logger)
 
 	lots := memory.NewLotStore()
 	sessions := memory.NewSessionStore()
+	payments := memory.NewPaymentStore()
 	notifier := notify.FromSettings(notify.TwilioSettings{
 		AccountSID: cfg.TwilioAccountSID,
 		AuthToken:  cfg.TwilioAuthToken,
 		FromNumber: cfg.TwilioFromNumber,
 	}, logger)
 
+	provider, err := payment.FromName(cfg.PaymentProvider)
+	if err != nil {
+		logger.Error("select payment provider", "error", err)
+		os.Exit(1)
+	}
+
+	paymentService := service.NewPaymentService(payments, lots, provider, cfg.PaymentHourlyRate, time.Now)
+
 	server := &http.Server{
-		Addr:              cfg.Addr,
-		Handler:           httpapi.NewRouter(service.NewLotService(lots, time.Now), service.NewSessionService(lots, sessions, time.Now, notifier, logger), logger),
+		Addr: cfg.Addr,
+		Handler: httpapi.NewRouter(
+			service.NewLotService(lots, time.Now),
+			service.NewSessionService(lots, sessions, paymentService, time.Now, notifier, logger),
+			paymentService,
+			logger,
+		),
 		ReadHeaderTimeout: cfg.ReadTimeout,
 		ReadTimeout:       cfg.ReadTimeout,
 		WriteTimeout:      cfg.WriteTimeout,
@@ -65,4 +88,34 @@ func main() {
 		os.Exit(1)
 	}
 	logger.Info("server stopped")
+}
+
+// loadDotEnv reads the optional .env file the README describes and sets only the
+// variables that are not already exported, so a real environment always wins.
+// A missing file is not an error: config.Load still rejects a missing
+// PAYMENT_HOURLY_RATE.
+func loadDotEnv(path string) {
+	contents, err := os.ReadFile(path)
+	if err != nil {
+		return
+	}
+
+	for _, line := range strings.Split(string(contents), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		key, value, found := strings.Cut(line, "=")
+		if !found {
+			continue
+		}
+		key = strings.TrimSpace(key)
+		value = strings.TrimSpace(value)
+		if key == "" || os.Getenv(key) != "" {
+			continue
+		}
+		if err := os.Setenv(key, value); err != nil {
+			continue
+		}
+	}
 }
