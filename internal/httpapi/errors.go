@@ -28,6 +28,8 @@ func (a *API) fail(w http.ResponseWriter, r *http.Request, err error) {
 		writeProblem(w, r, http.StatusConflict, "SESSION_NOT_ACTIVE", "The session has already been checked out.")
 	case errors.Is(err, domain.ErrPaymentNotPending):
 		writeProblem(w, r, http.StatusConflict, "PAYMENT_NOT_PENDING", "The payment has already reached a final status.")
+	case errors.Is(err, domain.ErrProviderUnavailable):
+		writeProblem(w, r, http.StatusBadGateway, "PROVIDER_ERROR", "The payment provider is unavailable; the payment is still PENDING and the checkout can be retried.")
 	default:
 		a.logger.Error("request failed",
 			"error", err,

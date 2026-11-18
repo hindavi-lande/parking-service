@@ -3,6 +3,7 @@ package service_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"testing"
 	"time"
 
@@ -19,10 +20,11 @@ var paymentClock = time.Date(2026, time.November, 17, 9, 0, 0, 0, time.UTC)
 // records what the service asked it to create and replays a configured webhook
 // event.
 type recordingProvider struct {
-	name        string
-	createCalls []payment.CreateRequest
-	createErr   error
-	event       payment.WebhookEvent
+	name         string
+	createCalls  []payment.CreateRequest
+	createErr    error
+	clientSecret string
+	event        payment.WebhookEvent
 }
 
 func (p *recordingProvider) Name() string {
@@ -32,9 +34,12 @@ func (p *recordingProvider) Name() string {
 	return p.name
 }
 
-func (p *recordingProvider) CreatePayment(_ context.Context, req payment.CreateRequest) error {
+func (p *recordingProvider) CreatePayment(_ context.Context, req payment.CreateRequest) (payment.CreateResult, error) {
 	p.createCalls = append(p.createCalls, req)
-	return p.createErr
+	if p.createErr != nil {
+		return payment.CreateResult{}, p.createErr
+	}
+	return payment.CreateResult{ClientSecret: p.clientSecret}, nil
 }
 
 func (p *recordingProvider) ParseWebhook(_ context.Context, _ payment.WebhookRequest) (payment.WebhookEvent, error) {
@@ -46,11 +51,24 @@ func (p *recordingProvider) ParseWebhook(_ context.Context, _ payment.WebhookReq
 func newPaymentService(t *testing.T, provider payment.Provider, defaultHourlyRate int64) (*service.PaymentService, *memory.PaymentStore, *memory.LotStore) {
 	t.Helper()
 
+	clock := func() time.Time { return paymentClock }
+	return newPaymentServiceWithClock(t, provider, defaultHourlyRate, clock)
+}
+
+// newPaymentServiceWithClock is newPaymentService with a clock the test owns, so
+// a test can move time forward and notice a payment that was rewritten.
+func newPaymentServiceWithClock(t *testing.T, provider payment.Provider, defaultHourlyRate int64, clock func() time.Time) (*service.PaymentService, *memory.PaymentStore, *memory.LotStore) {
+	t.Helper()
+
 	payments := memory.NewPaymentStore()
 	lots := memory.NewLotStore()
-	clock := func() time.Time { return paymentClock }
-
 	return service.NewPaymentService(payments, lots, provider, defaultHourlyRate, clock), payments, lots
+}
+
+// stripeProvider is a recording provider that answers like Stripe and reports
+// the given client secret.
+func stripeProvider(clientSecret string) *recordingProvider {
+	return &recordingProvider{name: payment.StripeProviderName, clientSecret: clientSecret}
 }
 
 // seededLot stores a lot with the given rate. A nil rate means the lot carries
@@ -207,19 +225,40 @@ func TestCreateForCheckoutIsIdempotentPerSession(t *testing.T) {
 	}
 }
 
-func TestCreateForCheckoutFailsWithoutStoringWhenProviderFails(t *testing.T) {
-	provider := &recordingProvider{createErr: errors.New("provider rejected the payment")}
+func TestCreateForCheckoutLeavesPaymentPendingWhenProviderFails(t *testing.T) {
+	provider := &recordingProvider{createErr: fmt.Errorf("stripe is down: %w", domain.ErrProviderUnavailable)}
 	svc, payments, lots := newPaymentService(t, provider, 5000)
 	lot := seededLot(t, lots, nil)
 	session := finishedSession("ses_rejected", lot.ID, time.Hour)
 	ctx := context.Background()
 
-	if _, err := svc.CreateForCheckout(ctx, session); err == nil {
-		t.Fatal("expected the provider error")
+	_, err := svc.CreateForCheckout(ctx, session)
+	if !errors.Is(err, domain.ErrProviderUnavailable) {
+		t.Fatalf("error = %v, want ErrProviderUnavailable", err)
 	}
 
-	if _, err := payments.GetBySession(ctx, session.ID); !errors.Is(err, domain.ErrNotFound) {
-		t.Errorf("stored payment error = %v, want ErrNotFound", err)
+	stored, err := payments.GetBySession(ctx, session.ID)
+	if err != nil {
+		t.Fatalf("get payment by session: %v", err)
+	}
+	if stored.Status != domain.PaymentPending {
+		t.Errorf("status = %q, want %q to survive the provider failure", stored.Status, domain.PaymentPending)
+	}
+	if stored.ClientSecret != "" {
+		t.Errorf("client secret = %q, want none when the provider failed", stored.ClientSecret)
+	}
+
+	// The retry finds the stored payment instead of asking the provider again,
+	// so a failed checkout cannot open a second payment intent.
+	retried, err := svc.CreateForCheckout(ctx, session)
+	if err != nil {
+		t.Fatalf("retry create payment: %v", err)
+	}
+	if retried.ID != stored.ID {
+		t.Errorf("retried payment id = %q, want %q", retried.ID, stored.ID)
+	}
+	if len(provider.createCalls) != 1 {
+		t.Errorf("provider calls = %d, want exactly one", len(provider.createCalls))
 	}
 }
 
@@ -285,6 +324,221 @@ func TestHandleWebhookRejectsUnknownProvider(t *testing.T) {
 	svc, _, _ := newPaymentService(t, provider, 5000)
 
 	_, err := svc.HandleWebhook(context.Background(), "other", payment.WebhookRequest{})
+
+	var validation *domain.ValidationError
+	if !errors.As(err, &validation) {
+		t.Fatalf("error = %v, want a ValidationError", err)
+	}
+	if validation.Field != "provider" {
+		t.Errorf("field = %q, want provider", validation.Field)
+	}
+}
+
+func TestCreateForCheckoutStoresTheProvidersClientSecret(t *testing.T) {
+	provider := stripeProvider("cs_test_1")
+	svc, payments, lots := newPaymentService(t, provider, 5000)
+	lot := seededLot(t, lots, nil)
+	session := finishedSession("ses_secret", lot.ID, time.Hour)
+	ctx := context.Background()
+
+	created, err := svc.CreateForCheckout(ctx, session)
+	if err != nil {
+		t.Fatalf("create payment: %v", err)
+	}
+	if created.ClientSecret != "cs_test_1" {
+		t.Errorf("client secret = %q, want cs_test_1", created.ClientSecret)
+	}
+
+	stored, err := payments.Get(ctx, created.ID)
+	if err != nil {
+		t.Fatalf("get stored payment: %v", err)
+	}
+	if stored.ClientSecret != "cs_test_1" {
+		t.Errorf("stored client secret = %q, want cs_test_1", stored.ClientSecret)
+	}
+	if stored.Status != domain.PaymentPending {
+		t.Errorf("status = %q, want %q", stored.Status, domain.PaymentPending)
+	}
+}
+
+func TestHandleStripeWebhookMarksPaidAndClearsTheClientSecret(t *testing.T) {
+	provider := stripeProvider("cs_test_1")
+	svc, payments, lots := newPaymentService(t, provider, 5000)
+	lot := seededLot(t, lots, nil)
+	session := finishedSession("ses_stripe_paid", lot.ID, time.Hour)
+	ctx := context.Background()
+
+	created, err := svc.CreateForCheckout(ctx, session)
+	if err != nil {
+		t.Fatalf("create payment: %v", err)
+	}
+
+	provider.event = payment.WebhookEvent{PaymentID: created.ID, Status: domain.PaymentPaid, EventID: "evt_paid"}
+	settled, err := svc.HandleStripeWebhook(ctx, payment.WebhookRequest{})
+	if err != nil {
+		t.Fatalf("stripe webhook: %v", err)
+	}
+	if settled.Status != domain.PaymentPaid {
+		t.Errorf("status = %q, want %q", settled.Status, domain.PaymentPaid)
+	}
+	if settled.ClientSecret != "" {
+		t.Errorf("client secret = %q, want it cleared once the payment is paid", settled.ClientSecret)
+	}
+	if settled.FailureMessage != "" {
+		t.Errorf("failure message = %q, want none for a paid payment", settled.FailureMessage)
+	}
+
+	stored, err := payments.Get(ctx, created.ID)
+	if err != nil {
+		t.Fatalf("get payment: %v", err)
+	}
+	if stored.Status != domain.PaymentPaid || stored.ClientSecret != "" {
+		t.Errorf("stored payment = %+v, want PAID without a client secret", stored)
+	}
+
+	processed, err := payments.IsEventProcessed(ctx, "evt_paid")
+	if err != nil {
+		t.Fatalf("is event processed: %v", err)
+	}
+	if !processed {
+		t.Error("evt_paid is not marked as processed")
+	}
+}
+
+func TestHandleStripeWebhookStoresTheFailureMessage(t *testing.T) {
+	provider := stripeProvider("cs_test_1")
+	svc, payments, lots := newPaymentService(t, provider, 5000)
+	lot := seededLot(t, lots, nil)
+	session := finishedSession("ses_stripe_failed", lot.ID, time.Hour)
+	ctx := context.Background()
+
+	created, err := svc.CreateForCheckout(ctx, session)
+	if err != nil {
+		t.Fatalf("create payment: %v", err)
+	}
+
+	provider.event = payment.WebhookEvent{
+		PaymentID:      created.ID,
+		Status:         domain.PaymentFailed,
+		EventID:        "evt_failed",
+		FailureMessage: "Your card was declined.",
+	}
+	settled, err := svc.HandleStripeWebhook(ctx, payment.WebhookRequest{})
+	if err != nil {
+		t.Fatalf("stripe webhook: %v", err)
+	}
+	if settled.Status != domain.PaymentFailed {
+		t.Errorf("status = %q, want %q", settled.Status, domain.PaymentFailed)
+	}
+	if settled.FailureMessage != "Your card was declined." {
+		t.Errorf("failure message = %q, want the provider's reason", settled.FailureMessage)
+	}
+	if settled.ClientSecret != "" {
+		t.Errorf("client secret = %q, want it cleared once the payment failed", settled.ClientSecret)
+	}
+
+	stored, err := payments.Get(ctx, created.ID)
+	if err != nil {
+		t.Fatalf("get payment: %v", err)
+	}
+	if stored.Status != domain.PaymentFailed || stored.FailureMessage != "Your card was declined." {
+		t.Errorf("stored payment = %+v, want FAILED with the failure message", stored)
+	}
+}
+
+func TestHandleStripeWebhookAnswersSuccessForRepeatedAndTerminalEvents(t *testing.T) {
+	provider := stripeProvider("cs_test_1")
+	now := paymentClock
+	clock := func() time.Time { return now }
+	svc, payments, lots := newPaymentServiceWithClock(t, provider, 5000, clock)
+	lot := seededLot(t, lots, nil)
+	session := finishedSession("ses_stripe_repeat", lot.ID, time.Hour)
+	ctx := context.Background()
+
+	created, err := svc.CreateForCheckout(ctx, session)
+	if err != nil {
+		t.Fatalf("create payment: %v", err)
+	}
+
+	provider.event = payment.WebhookEvent{PaymentID: created.ID, Status: domain.PaymentPaid, EventID: "evt_1"}
+	first, err := svc.HandleStripeWebhook(ctx, payment.WebhookRequest{})
+	if err != nil {
+		t.Fatalf("stripe webhook: %v", err)
+	}
+	now = now.Add(time.Hour)
+
+	// The same event id again: success, and the payment is untouched.
+	repeated, err := svc.HandleStripeWebhook(ctx, payment.WebhookRequest{})
+	if err != nil {
+		t.Fatalf("repeated webhook: %v", err)
+	}
+	if repeated.Status != domain.PaymentPaid || !repeated.UpdatedAt.Equal(first.UpdatedAt) {
+		t.Errorf("payment = %+v, want the unchanged %+v", repeated, first)
+	}
+
+	// A different event for the now-terminal payment: success, still untouched.
+	provider.event = payment.WebhookEvent{
+		PaymentID:      created.ID,
+		Status:         domain.PaymentFailed,
+		EventID:        "evt_2",
+		FailureMessage: "too late",
+	}
+	terminal, err := svc.HandleStripeWebhook(ctx, payment.WebhookRequest{})
+	if err != nil {
+		t.Fatalf("terminal webhook: %v", err)
+	}
+	if terminal.Status != domain.PaymentPaid || terminal.FailureMessage != "" || !terminal.UpdatedAt.Equal(first.UpdatedAt) {
+		t.Errorf("payment = %+v, want the unchanged %+v", terminal, first)
+	}
+
+	stored, err := payments.Get(ctx, created.ID)
+	if err != nil {
+		t.Fatalf("get payment: %v", err)
+	}
+	if stored.Status != domain.PaymentPaid || stored.FailureMessage != "" || !stored.UpdatedAt.Equal(first.UpdatedAt) {
+		t.Errorf("stored payment = %+v, want the paid payment unchanged", stored)
+	}
+
+	// The event that changed nothing is not recorded as handled.
+	processed, err := payments.IsEventProcessed(ctx, "evt_2")
+	if err != nil {
+		t.Fatalf("is event processed: %v", err)
+	}
+	if processed {
+		t.Error("evt_2 is marked as processed although it changed nothing")
+	}
+}
+
+func TestHandleStripeWebhookSkipsAnEventIdThatWasAlreadyHandled(t *testing.T) {
+	provider := stripeProvider("cs_test_1")
+	svc, payments, lots := newPaymentService(t, provider, 5000)
+	lot := seededLot(t, lots, nil)
+	session := finishedSession("ses_stripe_seen", lot.ID, time.Hour)
+	ctx := context.Background()
+
+	created, err := svc.CreateForCheckout(ctx, session)
+	if err != nil {
+		t.Fatalf("create payment: %v", err)
+	}
+	if err := payments.MarkEventProcessed(ctx, "evt_seen"); err != nil {
+		t.Fatalf("mark event processed: %v", err)
+	}
+
+	provider.event = payment.WebhookEvent{PaymentID: created.ID, Status: domain.PaymentPaid, EventID: "evt_seen"}
+	settled, err := svc.HandleStripeWebhook(ctx, payment.WebhookRequest{})
+	if err != nil {
+		t.Fatalf("stripe webhook: %v", err)
+	}
+	if settled.Status != domain.PaymentPending {
+		t.Errorf("status = %q, want %q for an event that was already handled", settled.Status, domain.PaymentPending)
+	}
+}
+
+func TestHandleStripeWebhookRejectsANonStripeProvider(t *testing.T) {
+	provider := &recordingProvider{name: payment.FakeProviderName}
+	svc, _, _ := newPaymentService(t, provider, 5000)
+
+	_, err := svc.HandleStripeWebhook(context.Background(), payment.WebhookRequest{})
 
 	var validation *domain.ValidationError
 	if !errors.As(err, &validation) {

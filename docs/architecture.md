@@ -39,3 +39,8 @@ or `service` imports chi, `net/http` or the memory package.
 - **External providers** (SMS, payments, gate control) should follow the same pattern: an
   interface in the consuming package, a real implementation, and a no-op or log-only
   implementation selected by configuration for local development and tests.
+- **Stripe lives in one package.** `internal/payments/stripe` is the only package that holds
+  the Stripe client, the secret key and the webhook signature check; it implements
+  `payment.Provider`, and `internal/payments` picks between it and the fake provider from
+  configuration. `internal/service` and `internal/domain` depend on `payment.Provider` alone,
+  so a provider change never reaches the business rules.

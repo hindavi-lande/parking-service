@@ -50,6 +50,7 @@ Everything is versioned under `/api/v1`. Times are UTC, RFC 3339.
 | `POST` | `/api/v1/sessions/{sessionID}/checkout` | end an active session and create its payment |
 | `GET`  | `/api/v1/payments/{paymentID}`    | read one payment with its status and timestamps    |
 | `POST` | `/api/v1/payments/webhooks/{provider}` | apply a provider callback to a pending payment |
+| `POST` | `/api/v1/payments/stripe/webhook` | apply a Stripe callback after verifying its signature |
 
 `kind` is `STANDARD` (default) or `EV`. Plates are trimmed, internal whitespace is
 collapsed and the value is upper-cased. A plate is 2–15 characters: letters, digits, spaces
@@ -94,11 +95,14 @@ Every checkout prices the finished session and creates exactly one `PENDING` pay
   `INR`.
 - The rate is the lot's `hourlyRate`. A lot without one uses `PAYMENT_HOURLY_RATE`; `0` on
   the lot means free parking.
-- The payment is created after the provider accepts it. A provider or pricing failure leaves
-  the session active so the checkout can be retried, and a session can never hold a second
-  payment: the second checkout is rejected with `409 SESSION_NOT_ACTIVE`.
+- The session is written as checked out before the payment is opened, so a pricing or provider
+  failure leaves the vehicle checked out with a `PENDING` payment instead of back in the lot.
+- The payment is stored before the provider is asked, so a retried checkout finds that payment
+  instead of opening a second one, and a session can never hold two payments. Checking out an
+  already checked-out session is rejected with `409 SESSION_NOT_ACTIVE`.
 - `GET /api/v1/payments/{paymentID}` returns the payment with its amount, currency, provider,
-  status, `createdAt` and `updatedAt`.
+  status, `createdAt` and `updatedAt`, plus the optional `clientSecret` and `failureMessage`
+  described under [Stripe](#stripe).
 - `POST /api/v1/payments/webhooks/{provider}` applies a provider callback. The path
   must name the provider `PAYMENT_PROVIDER` selected; any other name fails with a
   `400 VALIDATION_FAILED` problem. A callback moves a `PENDING` payment to `PAID` or
@@ -113,6 +117,30 @@ curl -s -X POST localhost:8080/api/v1/payments/webhooks/fake \
   -H 'Content-Type: application/json' \
   -d '{"paymentId":"<paymentID>","status":"PAID"}'
 ```
+
+### Stripe
+
+With `PAYMENT_PROVIDER=stripe` the checkout opens a Stripe PaymentIntent for the same amount
+and currency and returns the payment with an optional `clientSecret`: the single-use secret
+the client confirms the PaymentIntent with. Card data never reaches this service — the client
+confirms the PaymentIntent directly with Stripe. The payment also carries an optional
+`failureMessage`, filled in when a callback reports why a card was declined. Both fields are
+omitted from the JSON while they are empty, so a payment from the fake provider keeps exactly
+its old shape.
+
+Register `https://<your-host>/api/v1/payments/stripe/webhook` as the webhook URL in the
+Stripe dashboard. The route verifies the `Stripe-Signature` header against the raw request
+body with `STRIPE_WEBHOOK_SECRET`; a callback that does not verify answers
+`400 VALIDATION_FAILED` and changes nothing. `payment_intent.succeeded` marks the payment
+`PAID` and `payment_intent.payment_failed` marks it `FAILED` together with the failure
+message. Handling is idempotent: a repeated event id, or an event for a payment that already
+reached a terminal status, answers `200` and changes nothing. The generic route
+`/api/v1/payments/webhooks/{provider}` keeps its old behaviour for every other provider and
+still answers `409 PAYMENT_NOT_PENDING` for a terminal payment.
+
+A Stripe timeout or 5xx answers `502 PROVIDER_ERROR`. The payment stays `PENDING` and the
+session stays checked out, so the same checkout can be retried without opening a second
+payment.
 
 ### Errors
 
@@ -138,6 +166,7 @@ the same shape as the banking service, plus a stable `code`:
 | `409`  | `SESSION_NOT_ACTIVE`  | the session was already checked out                |
 | `409`  | `PAYMENT_NOT_PENDING` | the payment already reached a final status         |
 | `500`  | `INTERNAL_ERROR`      | unexpected failure; details are logged, not returned |
+| `502`  | `PROVIDER_ERROR`      | the payment provider timed out or answered 5xx; the payment is still `PENDING` |
 
 ### Notifications
 
@@ -175,17 +204,23 @@ something, then export it.
 | `HTTP_WRITE_TIMEOUT`     | `10s`   | write timeout                       |
 | `HTTP_IDLE_TIMEOUT`      | `60s`   | keep-alive idle timeout             |
 | `HTTP_SHUTDOWN_TIMEOUT`  | `10s`   | grace period for in-flight requests |
-| `PAYMENT_PROVIDER`       | `fake`  | payment provider; `fake` needs no account |
+| `PAYMENT_PROVIDER`       | `fake`  | payment provider: `fake` or `stripe` |
 | `PAYMENT_HOURLY_RATE`    | –       | required default hourly rate in minor units |
+| `STRIPE_SECRET_KEY`      | –       | required when `PAYMENT_PROVIDER=stripe`; never committed |
+| `STRIPE_WEBHOOK_SECRET`  | –       | required when `PAYMENT_PROVIDER=stripe`; never committed |
+| `STRIPE_API_BASE_URL`    | –       | optional Stripe API base URL; Stripe itself when empty |
 | `TWILIO_ACCOUNT_SID`     | –       | Twilio account SID for the confirmation SMS |
 | `TWILIO_AUTH_TOKEN`      | –       | Twilio auth token; never logged or printed  |
 | `TWILIO_FROM_NUMBER`     | –       | sender number the confirmation SMS comes from |
 
 `PAYMENT_HOURLY_RATE` has no default and is read as an integer in minor units (`5000` is
 INR 50.00), so the process cannot start without a usable rate. It prices every lot that was
-created without an `hourlyRate` of its own. `PAYMENT_PROVIDER` selects the provider; only
-`fake` exists today, it performs no network call, and any other name fails startup. The
-currency is not configurable: payments are always in `INR`.
+created without an `hourlyRate` of its own. `PAYMENT_PROVIDER` selects the provider: `fake`
+performs no network call, `stripe` calls the Stripe API, and any other name fails startup.
+Selecting `stripe` without `STRIPE_SECRET_KEY` or `STRIPE_WEBHOOK_SECRET` also fails startup;
+the error names the missing variable and never echoes a value, and neither secret belongs in
+the repository. `STRIPE_API_BASE_URL` is optional and points at Stripe itself when it is
+empty. The currency is not configurable: payments are always in `INR`.
 
 The three `TWILIO_*` settings have no defaults and hold no credential in the repository. The
 SMS provider is used only when all three are set; if any one of them is missing, the service
@@ -201,6 +236,7 @@ internal/store/          repository interfaces
 internal/store/memory/   in-memory implementation (local + tests)
 internal/service/        business rules
 internal/payment/        provider interface and the no-account fake implementation
+internal/payments/       provider selection, and the Stripe client in internal/payments/stripe
 internal/httpapi/        chi router, handlers, DTOs, problem+json errors, middleware
 docs/                    architecture notes
 ```

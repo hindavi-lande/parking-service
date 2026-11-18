@@ -5,15 +5,19 @@ package payment
 
 import (
 	"context"
-	"fmt"
-	"strings"
 
 	"github.com/techverito/parking-service/internal/domain"
 )
 
-// FakeProviderName is the provider PAYMENT_PROVIDER selects by default. It
-// needs no account, so the service and its tests run without one.
-const FakeProviderName = "fake"
+const (
+	// FakeProviderName is the provider PAYMENT_PROVIDER selects by default. It
+	// needs no account, so the service and its tests run without one.
+	FakeProviderName = "fake"
+	// StripeProviderName is the provider PAYMENT_PROVIDER selects for Stripe. It
+	// is declared here so internal/service can recognise the Stripe provider
+	// without importing the client package.
+	StripeProviderName = "stripe"
+)
 
 // CreateRequest is everything a provider needs to open a payment. Amount is an
 // integer in minor units of Currency.
@@ -23,6 +27,13 @@ type CreateRequest struct {
 	LotID     string
 	Amount    int64
 	Currency  string
+}
+
+// CreateResult is what a provider reports after it opened a payment.
+// ClientSecret is the single-use credential the client confirms the payment
+// with; the zero value means the provider issues no client secret.
+type CreateResult struct {
+	ClientSecret string
 }
 
 // WebhookRequest is a raw provider callback. Body is the untouched request body
@@ -38,23 +49,17 @@ type WebhookRequest struct {
 type WebhookEvent struct {
 	PaymentID string
 	Status    domain.PaymentStatus
+	// EventID is the provider's own event identifier, used to handle a repeated
+	// callback once. It is empty when the provider sends none.
+	EventID string
+	// FailureMessage is the provider's human-readable reason for a failure. It
+	// is empty unless the event reports one.
+	FailureMessage string
 }
 
 // Provider opens a payment and reports what a callback means.
 type Provider interface {
 	Name() string
-	CreatePayment(ctx context.Context, req CreateRequest) error
+	CreatePayment(ctx context.Context, req CreateRequest) (CreateResult, error)
 	ParseWebhook(ctx context.Context, req WebhookRequest) (WebhookEvent, error)
-}
-
-// FromName returns the provider registered under name. Only the fake provider
-// exists today, so any other name is an error and startup can fail loudly
-// instead of silently running without a provider.
-func FromName(name string) (Provider, error) {
-	switch strings.ToLower(strings.TrimSpace(name)) {
-	case FakeProviderName:
-		return NewFakeProvider(nil), nil
-	default:
-		return nil, fmt.Errorf("unknown payment provider %q", name)
-	}
 }

@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -12,9 +14,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/techverito/parking-service/internal/domain"
 	"github.com/techverito/parking-service/internal/httpapi"
 	"github.com/techverito/parking-service/internal/notify"
 	"github.com/techverito/parking-service/internal/payment"
+	"github.com/techverito/parking-service/internal/payments"
 	"github.com/techverito/parking-service/internal/service"
 	"github.com/techverito/parking-service/internal/store/memory"
 )
@@ -39,21 +43,31 @@ func newTestServerWithNotifier(t *testing.T, notifier notify.Notifier) *httptest
 	return server
 }
 
-// newTestServerWithStores builds the real router and returns the payment store
-// too, so a test can assert which payments a session received.
+// newTestServerWithStores builds the real router with the fake payment provider
+// and returns the payment store too, so a test can assert which payments a
+// session received.
 func newTestServerWithStores(t *testing.T, notifier notify.Notifier) (*httptest.Server, *memory.PaymentStore) {
+	t.Helper()
+
+	provider, err := payments.FromSettings(payments.Settings{Name: payment.FakeProviderName})
+	if err != nil {
+		t.Fatalf("build payment provider: %v", err)
+	}
+	return newTestServerWithProvider(t, notifier, provider)
+}
+
+// newTestServerWithProvider builds the real router around the given payment
+// provider and returns the payment store too, so a test can assert what the
+// checkout persisted after a provider failure.
+func newTestServerWithProvider(t *testing.T, notifier notify.Notifier, provider payment.Provider) (*httptest.Server, *memory.PaymentStore) {
 	t.Helper()
 
 	lots := memory.NewLotStore()
 	sessions := memory.NewSessionStore()
-	payments := memory.NewPaymentStore()
+	paymentStore := memory.NewPaymentStore()
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 
-	provider, err := payment.FromName(payment.FakeProviderName)
-	if err != nil {
-		t.Fatalf("build payment provider: %v", err)
-	}
-	paymentService := service.NewPaymentService(payments, lots, provider, testHourlyRate, time.Now)
+	paymentService := service.NewPaymentService(paymentStore, lots, provider, testHourlyRate, time.Now)
 
 	server := httptest.NewServer(httpapi.NewRouter(
 		service.NewLotService(lots, time.Now),
@@ -62,7 +76,7 @@ func newTestServerWithStores(t *testing.T, notifier notify.Notifier) (*httptest.
 		logger,
 	))
 	t.Cleanup(server.Close)
-	return server, payments
+	return server, paymentStore
 }
 
 // recordingNotifier records the messages the service tried to send so the HTTP
@@ -75,6 +89,21 @@ type recordingNotifier struct {
 func (n *recordingNotifier) Send(_ context.Context, msg notify.Message) error {
 	n.messages = append(n.messages, msg)
 	return n.err
+}
+
+// unavailableProvider is a payment.Provider whose CreatePayment always reports
+// the provider as unreachable, so the 502 mapping can be asserted through the
+// real router without a network call.
+type unavailableProvider struct{}
+
+func (unavailableProvider) Name() string { return payment.FakeProviderName }
+
+func (unavailableProvider) CreatePayment(_ context.Context, _ payment.CreateRequest) (payment.CreateResult, error) {
+	return payment.CreateResult{}, fmt.Errorf("provider is down: %w", domain.ErrProviderUnavailable)
+}
+
+func (unavailableProvider) ParseWebhook(_ context.Context, _ payment.WebhookRequest) (payment.WebhookEvent, error) {
+	return payment.WebhookEvent{}, errors.New("parse webhook is not used by this stub")
 }
 
 func request(t *testing.T, server *httptest.Server, method, path string, body any) (*http.Response, []byte) {
@@ -140,15 +169,17 @@ type sessionBody struct {
 }
 
 type paymentBody struct {
-	ID        string    `json:"id"`
-	SessionID string    `json:"sessionId"`
-	LotID     string    `json:"lotId"`
-	Amount    int64     `json:"amount"`
-	Currency  string    `json:"currency"`
-	Provider  string    `json:"provider"`
-	Status    string    `json:"status"`
-	CreatedAt time.Time `json:"createdAt"`
-	UpdatedAt time.Time `json:"updatedAt"`
+	ID             string    `json:"id"`
+	SessionID      string    `json:"sessionId"`
+	LotID          string    `json:"lotId"`
+	Amount         int64     `json:"amount"`
+	Currency       string    `json:"currency"`
+	Provider       string    `json:"provider"`
+	Status         string    `json:"status"`
+	CreatedAt      time.Time `json:"createdAt"`
+	UpdatedAt      time.Time `json:"updatedAt"`
+	ClientSecret   string    `json:"clientSecret"`
+	FailureMessage string    `json:"failureMessage"`
 }
 
 type problemBody struct {
@@ -592,6 +623,18 @@ func TestGetPaymentReturnsStatusAndTimestamps(t *testing.T) {
 	if stored.CreatedAt.IsZero() || stored.UpdatedAt.IsZero() {
 		t.Errorf("payment = %+v, want both timestamps", stored)
 	}
+	if stored.ClientSecret != "" || stored.FailureMessage != "" {
+		t.Errorf("payment = %+v, want no client secret or failure message from the fake provider", stored)
+	}
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(payload, &raw); err != nil {
+		t.Fatalf("decode response %q: %v", payload, err)
+	}
+	for _, field := range []string{"clientSecret", "failureMessage"} {
+		if _, ok := raw[field]; ok {
+			t.Errorf("response %s carries %q, want it omitted when empty", payload, field)
+		}
+	}
 
 	resp, payload = request(t, server, http.MethodGet, "/api/v1/payments/missing", nil)
 	if resp.StatusCode != http.StatusNotFound {
@@ -693,5 +736,129 @@ func TestCheckoutTwiceReturnsOnePayment(t *testing.T) {
 	}
 	if stored.ID != first.Payment.ID {
 		t.Errorf("payment id = %q, want the only payment %q", stored.ID, first.Payment.ID)
+	}
+}
+
+// TestPaymentResponseCarriesOptionalProviderDetails seeds a payment directly,
+// because no route can set a client secret or a failure message yet, and reads
+// it back to assert the wire shape of the two optional fields.
+func TestPaymentResponseCarriesOptionalProviderDetails(t *testing.T) {
+	server, payments := newTestServerWithStores(t, nil)
+	ctx := context.Background()
+	now := time.Date(2026, time.November, 17, 9, 0, 0, 0, time.UTC)
+
+	pending := domain.Payment{
+		ID:           "pay_pending",
+		SessionID:    "ses_pending",
+		LotID:        "lot_seeded",
+		Amount:       testHourlyRate,
+		Currency:     domain.CurrencyINR,
+		Provider:     "stripe",
+		Status:       domain.PaymentPending,
+		ClientSecret: "cs_test_1",
+		CreatedAt:    now,
+		UpdatedAt:    now,
+	}
+	failed := domain.Payment{
+		ID:             "pay_failed",
+		SessionID:      "ses_failed",
+		LotID:          "lot_seeded",
+		Amount:         testHourlyRate,
+		Currency:       domain.CurrencyINR,
+		Provider:       "stripe",
+		Status:         domain.PaymentFailed,
+		FailureMessage: "Your card was declined.",
+		CreatedAt:      now,
+		UpdatedAt:      now,
+	}
+	for _, seeded := range []domain.Payment{pending, failed} {
+		if err := payments.Create(ctx, seeded); err != nil {
+			t.Fatalf("seed payment %s: %v", seeded.ID, err)
+		}
+	}
+
+	resp, payload := request(t, server, http.MethodGet, "/api/v1/payments/"+pending.ID, nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("get pending payment status = %d, body = %s", resp.StatusCode, payload)
+	}
+	got := decode[paymentBody](t, payload)
+	if got.ClientSecret != "cs_test_1" {
+		t.Errorf("clientSecret = %q, want %q", got.ClientSecret, "cs_test_1")
+	}
+	if got.FailureMessage != "" {
+		t.Errorf("failureMessage = %q, want it empty while the payment is pending", got.FailureMessage)
+	}
+
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(payload, &raw); err != nil {
+		t.Fatalf("decode response %q: %v", payload, err)
+	}
+	secret, ok := raw["clientSecret"]
+	if !ok || string(secret) != `"cs_test_1"` {
+		t.Errorf("clientSecret = %s, want \"cs_test_1\"", secret)
+	}
+	if value, ok := raw["failureMessage"]; ok {
+		t.Errorf("response carries failureMessage = %s, want it omitted when empty", value)
+	}
+
+	resp, payload = request(t, server, http.MethodGet, "/api/v1/payments/"+failed.ID, nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("get failed payment status = %d, body = %s", resp.StatusCode, payload)
+	}
+	if got := decode[paymentBody](t, payload); got.FailureMessage != "Your card was declined." {
+		t.Errorf("failureMessage = %q, want the stored failure message", got.FailureMessage)
+	}
+
+	raw = nil
+	if err := json.Unmarshal(payload, &raw); err != nil {
+		t.Fatalf("decode response %q: %v", payload, err)
+	}
+	message, ok := raw["failureMessage"]
+	if !ok || string(message) != `"Your card was declined."` {
+		t.Errorf("failureMessage = %s, want \"Your card was declined.\"", message)
+	}
+	if value, ok := raw["clientSecret"]; ok {
+		t.Errorf("response carries clientSecret = %s, want it omitted when empty", value)
+	}
+}
+
+// TestCheckoutProviderFailureReturnsBadGateway covers a provider timeout or 5xx
+// during checkout: the handler answers 502 PROVIDER_ERROR, the session stays
+// checked out and the payment it created stays PENDING.
+func TestCheckoutProviderFailureReturnsBadGateway(t *testing.T) {
+	server, payments := newTestServerWithProvider(t, nil, unavailableProvider{})
+	lot := createLot(t, server, 1)
+	session := checkInVehicle(t, server, lot.ID, "KA 01 AB 1234")
+
+	resp, payload := request(t, server, http.MethodPost, "/api/v1/sessions/"+session.ID+"/checkout", nil)
+	if resp.StatusCode != http.StatusBadGateway {
+		t.Fatalf("checkout status = %d, want 502, body = %s", resp.StatusCode, payload)
+	}
+	body := decode[problemBody](t, payload)
+	if body.Code != "PROVIDER_ERROR" {
+		t.Errorf("code = %q, want PROVIDER_ERROR", body.Code)
+	}
+	if body.Status != http.StatusBadGateway {
+		t.Errorf("status = %d, want 502", body.Status)
+	}
+	if contentType := resp.Header.Get("Content-Type"); !strings.HasPrefix(contentType, "application/problem+json") {
+		t.Errorf("Content-Type = %q, want application/problem+json", contentType)
+	}
+
+	resp, payload = request(t, server, http.MethodGet, "/api/v1/sessions/"+session.ID, nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("get session status = %d, body = %s", resp.StatusCode, payload)
+	}
+	stored := decode[sessionBody](t, payload)
+	if stored.Status != "CHECKED_OUT" || stored.CheckedOutAt == nil {
+		t.Errorf("session = %+v, want a checked-out session with a timestamp", stored)
+	}
+
+	pending, err := payments.GetBySession(context.Background(), session.ID)
+	if err != nil {
+		t.Fatalf("get payment by session: %v", err)
+	}
+	if pending.Status != domain.PaymentPending {
+		t.Errorf("payment status = %q, want %q", pending.Status, domain.PaymentPending)
 	}
 }

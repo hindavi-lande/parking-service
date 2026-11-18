@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"strings"
@@ -13,6 +14,7 @@ import (
 	"github.com/techverito/parking-service/internal/domain"
 	"github.com/techverito/parking-service/internal/notify"
 	"github.com/techverito/parking-service/internal/payment"
+	"github.com/techverito/parking-service/internal/payments"
 	"github.com/techverito/parking-service/internal/service"
 	"github.com/techverito/parking-service/internal/store/memory"
 )
@@ -31,17 +33,17 @@ func newHarness(t *testing.T, msgNotifier notify.Notifier, logger *slog.Logger) 
 
 	lots := memory.NewLotStore()
 	sessions := memory.NewSessionStore()
-	payments := memory.NewPaymentStore()
+	paymentStore := memory.NewPaymentStore()
 	lotService := service.NewLotService(lots, clock)
 
 	if logger == nil {
 		logger = slog.New(slog.NewTextHandler(io.Discard, nil))
 	}
-	provider, err := payment.FromName(payment.FakeProviderName)
+	provider, err := payments.FromSettings(payments.Settings{Name: payment.FakeProviderName})
 	if err != nil {
 		t.Fatalf("build payment provider: %v", err)
 	}
-	paymentService := service.NewPaymentService(payments, lots, provider, defaultTestHourlyRate, clock)
+	paymentService := service.NewPaymentService(paymentStore, lots, provider, defaultTestHourlyRate, clock)
 	sessionService := service.NewSessionService(lots, sessions, paymentService, clock, msgNotifier, logger)
 
 	lot, err := lotService.Create(context.Background(), service.CreateLotInput{
@@ -52,7 +54,7 @@ func newHarness(t *testing.T, msgNotifier notify.Notifier, logger *slog.Logger) 
 	if err != nil {
 		t.Fatalf("create lot: %v", err)
 	}
-	return lotService, sessionService, payments, lot
+	return lotService, sessionService, paymentStore, lot
 }
 
 func newServices(t *testing.T) (*service.LotService, *service.SessionService, domain.Lot) {
@@ -72,6 +74,24 @@ type recordingNotifier struct {
 func (n *recordingNotifier) Send(_ context.Context, msg notify.Message) error {
 	n.messages = append(n.messages, msg)
 	return n.err
+}
+
+// unavailableProvider is a payment.Provider whose CreatePayment always reports
+// the provider as unreachable. It counts its calls, so a test can prove the
+// checkout reached the provider exactly once.
+type unavailableProvider struct {
+	createCalls int
+}
+
+func (p *unavailableProvider) Name() string { return payment.FakeProviderName }
+
+func (p *unavailableProvider) CreatePayment(_ context.Context, _ payment.CreateRequest) (payment.CreateResult, error) {
+	p.createCalls++
+	return payment.CreateResult{}, fmt.Errorf("provider is down: %w", domain.ErrProviderUnavailable)
+}
+
+func (p *unavailableProvider) ParseWebhook(_ context.Context, _ payment.WebhookRequest) (payment.WebhookEvent, error) {
+	return payment.WebhookEvent{}, errors.New("parse webhook is not used by this stub")
 }
 
 // newServicesWithNotifier wires the services with the given notifier and an
@@ -184,6 +204,75 @@ func TestCheckoutTwiceIsAConflict(t *testing.T) {
 	}
 	if stored.ID != pending.ID {
 		t.Errorf("payment id = %q, want the only payment %q", stored.ID, pending.ID)
+	}
+}
+
+func TestCheckoutStaysCheckedOutWhenTheProviderFails(t *testing.T) {
+	fixed := time.Date(2026, time.November, 17, 9, 0, 0, 0, time.UTC)
+	clock := func() time.Time { return fixed }
+
+	lots := memory.NewLotStore()
+	sessions := memory.NewSessionStore()
+	paymentStore := memory.NewPaymentStore()
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	provider := &unavailableProvider{}
+
+	paymentService := service.NewPaymentService(paymentStore, lots, provider, defaultTestHourlyRate, clock)
+	sessionService := service.NewSessionService(lots, sessions, paymentService, clock, nil, logger)
+	ctx := context.Background()
+
+	lot, err := service.NewLotService(lots, clock).Create(ctx, service.CreateLotInput{
+		Name:     "Central Plaza",
+		Address:  "MG Road",
+		Capacity: 1,
+	})
+	if err != nil {
+		t.Fatalf("create lot: %v", err)
+	}
+	session, err := sessionService.CheckIn(ctx, lot.ID, service.CheckInInput{Plate: "KA 01 AB 1234"})
+	if err != nil {
+		t.Fatalf("check in: %v", err)
+	}
+
+	if _, _, err := sessionService.Checkout(ctx, session.ID); !errors.Is(err, domain.ErrProviderUnavailable) {
+		t.Fatalf("checkout error = %v, want ErrProviderUnavailable", err)
+	}
+
+	// The session is written before the payment is opened, so the vehicle stays
+	// checked out with the PENDING payment the attempt persisted.
+	stored, err := sessionService.Get(ctx, session.ID)
+	if err != nil {
+		t.Fatalf("get session: %v", err)
+	}
+	if stored.Status != domain.SessionCheckedOut {
+		t.Errorf("status = %q, want %q after a provider failure", stored.Status, domain.SessionCheckedOut)
+	}
+	if stored.CheckedOutAt == nil {
+		t.Fatal("checkedOutAt is nil")
+	}
+
+	pending, err := paymentStore.GetBySession(ctx, session.ID)
+	if err != nil {
+		t.Fatalf("get payment by session: %v", err)
+	}
+	if pending.Status != domain.PaymentPending {
+		t.Errorf("payment status = %q, want %q", pending.Status, domain.PaymentPending)
+	}
+
+	// Repeating the checkout is a conflict that reaches neither the payment
+	// service nor the provider, so the one payment survives unchanged.
+	if _, _, err := sessionService.Checkout(ctx, session.ID); !errors.Is(err, domain.ErrSessionNotActive) {
+		t.Fatalf("second checkout error = %v, want ErrSessionNotActive", err)
+	}
+	if provider.createCalls != 1 {
+		t.Errorf("provider calls = %d, want exactly one", provider.createCalls)
+	}
+	again, err := paymentStore.GetBySession(ctx, session.ID)
+	if err != nil {
+		t.Fatalf("get payment by session after the retry: %v", err)
+	}
+	if again.ID != pending.ID {
+		t.Errorf("payment id = %q, want the only payment %q", again.ID, pending.ID)
 	}
 }
 

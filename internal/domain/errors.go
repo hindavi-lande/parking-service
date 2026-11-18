@@ -17,6 +17,10 @@ var (
 	ErrPaymentNotPending = errors.New("payment is not pending")
 	// ErrPaymentExists means the session already has a payment.
 	ErrPaymentExists = errors.New("payment already exists for session")
+	// ErrProviderUnavailable means the payment provider could not be reached or
+	// answered with a server error, so the payment is still PENDING and the
+	// call can be retried. The HTTP layer maps it to 502.
+	ErrProviderUnavailable = errors.New("payment provider unavailable")
 )
 
 // ValidationError describes a rejected input field. Services return it for

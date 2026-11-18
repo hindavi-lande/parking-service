@@ -30,8 +30,9 @@ func (p *FakeProvider) Name() string {
 	return FakeProviderName
 }
 
-// CreatePayment logs the payment and returns nil. It performs no I/O.
-func (p *FakeProvider) CreatePayment(_ context.Context, req CreateRequest) error {
+// CreatePayment logs the payment and reports no client secret. It performs no
+// I/O.
+func (p *FakeProvider) CreatePayment(_ context.Context, req CreateRequest) (CreateResult, error) {
 	p.logger.Info("fake payment provider accepted a payment",
 		"payment_id", req.PaymentID,
 		"session_id", req.SessionID,
@@ -39,7 +40,7 @@ func (p *FakeProvider) CreatePayment(_ context.Context, req CreateRequest) error
 		"amount", req.Amount,
 		"currency", req.Currency,
 	)
-	return nil
+	return CreateResult{}, nil
 }
 
 // fakeWebhookPayload is the documented body the fake provider parses:
