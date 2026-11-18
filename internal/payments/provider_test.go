@@ -28,6 +28,22 @@ func TestFromNameRejectsUnknownProvider(t *testing.T) {
 	}
 }
 
+func TestFromSettingsSelectsRazorpay(t *testing.T) {
+	provider, err := payments.FromSettings(payments.Settings{
+		Name:                  "  RAZORPAY ",
+		RazorpayKeyID:         "rzp_test_config",
+		RazorpayKeySecret:     "rzp_secret_config",
+		RazorpayWebhookSecret: "whsec_rzp_config",
+		RazorpayBaseURL:       "http://127.0.0.1:12112",
+	})
+	if err != nil {
+		t.Fatalf("from settings: %v", err)
+	}
+	if got := provider.Name(); got != payment.RazorpayProviderName {
+		t.Errorf("name = %q, want %q", got, payment.RazorpayProviderName)
+	}
+}
+
 func TestFromSettingsSelectsStripe(t *testing.T) {
 	provider, err := payments.FromSettings(payments.Settings{
 		Name:                "  STRIPE ",

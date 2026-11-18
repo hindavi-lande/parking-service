@@ -30,6 +30,16 @@ type Config struct {
 	StripeWebhookSecret string
 	StripeBaseURL       string
 
+	// Razorpay settings. RazorpayKeyID is the publishable key id the client
+	// launches Razorpay Checkout with, so it is not a secret. RazorpayKeySecret
+	// and RazorpayWebhookSecret are required when PaymentProvider is razorpay,
+	// are never logged and never appear in an error message. RazorpayBaseURL is
+	// optional; empty means the Razorpay API default.
+	RazorpayKeyID         string
+	RazorpayKeySecret     string
+	RazorpayWebhookSecret string
+	RazorpayBaseURL       string
+
 	// Twilio settings for the confirmation SMS. Empty means the service uses the
 	// log-only notifier, and no default is ever a real credential.
 	TwilioAccountSID string
@@ -41,7 +51,8 @@ type Config struct {
 // service starts with no environment set up. PAYMENT_HOURLY_RATE has no
 // default, and a missing, non-numeric or negative value is an error so the
 // process cannot start without a usable rate. The two Stripe secrets are
-// required only when PAYMENT_PROVIDER selects stripe.
+// required only when PAYMENT_PROVIDER selects stripe, and the Razorpay key id,
+// key secret and webhook secret only when it selects razorpay.
 func Load() (Config, error) {
 	cfg := Config{
 		Env:             stringEnv("APP_ENV", "local"),
@@ -56,6 +67,11 @@ func Load() (Config, error) {
 		StripeSecretKey:     stringEnv("STRIPE_SECRET_KEY", ""),
 		StripeWebhookSecret: stringEnv("STRIPE_WEBHOOK_SECRET", ""),
 		StripeBaseURL:       stringEnv("STRIPE_API_BASE_URL", ""),
+
+		RazorpayKeyID:         stringEnv("RAZORPAY_KEY_ID", ""),
+		RazorpayKeySecret:     stringEnv("RAZORPAY_KEY_SECRET", ""),
+		RazorpayWebhookSecret: stringEnv("RAZORPAY_WEBHOOK_SECRET", ""),
+		RazorpayBaseURL:       stringEnv("RAZORPAY_API_BASE_URL", ""),
 
 		TwilioAccountSID: stringEnv("TWILIO_ACCOUNT_SID", ""),
 		TwilioAuthToken:  stringEnv("TWILIO_AUTH_TOKEN", ""),
@@ -82,6 +98,28 @@ func Load() (Config, error) {
 		}
 		cfg.StripeSecretKey = secretKey
 		cfg.StripeWebhookSecret = webhookSecret
+	}
+
+	// The Razorpay provider cannot run without its key pair and its webhook
+	// secret either, so a missing one is a startup error rather than a surprise
+	// on the first checkout. The error names the variable and never echoes a
+	// value.
+	if strings.EqualFold(strings.TrimSpace(cfg.PaymentProvider), "razorpay") {
+		keyID, err := requiredStringEnv("RAZORPAY_KEY_ID")
+		if err != nil {
+			return cfg, err
+		}
+		keySecret, err := requiredStringEnv("RAZORPAY_KEY_SECRET")
+		if err != nil {
+			return cfg, err
+		}
+		webhookSecret, err := requiredStringEnv("RAZORPAY_WEBHOOK_SECRET")
+		if err != nil {
+			return cfg, err
+		}
+		cfg.RazorpayKeyID = keyID
+		cfg.RazorpayKeySecret = keySecret
+		cfg.RazorpayWebhookSecret = webhookSecret
 	}
 
 	return cfg, nil

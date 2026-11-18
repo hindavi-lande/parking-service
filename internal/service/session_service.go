@@ -156,10 +156,11 @@ func (s *SessionService) Get(ctx context.Context, id string) (domain.Session, er
 }
 
 // Checkout ends an active session and returns it together with its payment.
-// Checking out twice is a conflict, not a silent success, so a retried request
-// can neither extend a stay nor charge again. The session is written before the
-// payment is opened, so a pricing or provider failure leaves the vehicle checked
-// out with a PENDING payment instead of putting it back in the lot.
+// Checking out an already checked-out session is idempotent: it answers with the
+// payment the first checkout made, so a retried request can neither extend a
+// stay nor charge again. The session is written before the payment is opened, so
+// a pricing or provider failure leaves the vehicle checked out with a PENDING
+// payment instead of putting it back in the lot.
 func (s *SessionService) Checkout(ctx context.Context, id string) (domain.Session, domain.Payment, error) {
 	if s.payments == nil {
 		return domain.Session{}, domain.Payment{}, errors.New("checkout: no payment service configured")
@@ -168,6 +169,16 @@ func (s *SessionService) Checkout(ctx context.Context, id string) (domain.Sessio
 	session, err := s.sessions.Get(ctx, id)
 	if err != nil {
 		return domain.Session{}, domain.Payment{}, fmt.Errorf("get session %q: %w", id, err)
+	}
+	// A retried checkout finds the stored payment and returns it: the payment
+	// service only opens a new one when the session has none yet, so a repeat
+	// call can never charge twice.
+	if session.Status == domain.SessionCheckedOut {
+		stored, err := s.payments.CreateForCheckout(ctx, session)
+		if err != nil {
+			return domain.Session{}, domain.Payment{}, err
+		}
+		return session, stored, nil
 	}
 	if session.Status != domain.SessionActive {
 		return domain.Session{}, domain.Payment{}, fmt.Errorf("session %q: %w", id, domain.ErrSessionNotActive)

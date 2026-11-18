@@ -57,6 +57,8 @@ func NewRouter(lots *service.LotService, sessions *service.SessionService, payme
 			// Stripe is told to call this fixed URL, so the provider is not part
 			// of the path.
 			r.Post("/stripe/webhook", api.stripeWebhook)
+			// Razorpay is told to call this fixed URL too.
+			r.Post("/razorpay/webhook", api.razorpayWebhook)
 		})
 	})
 

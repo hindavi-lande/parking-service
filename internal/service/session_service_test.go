@@ -169,7 +169,7 @@ func TestCheckInStopsWhenLotIsFull(t *testing.T) {
 	}
 }
 
-func TestCheckoutTwiceIsAConflict(t *testing.T) {
+func TestCheckoutTwiceReturnsTheSamePayment(t *testing.T) {
 	_, sessions, payments, lot := newHarness(t, nil, nil)
 	ctx := context.Background()
 
@@ -192,12 +192,23 @@ func TestCheckoutTwiceIsAConflict(t *testing.T) {
 		t.Errorf("payment status = %q, want %q", pending.Status, domain.PaymentPending)
 	}
 
-	if _, _, err := sessions.Checkout(ctx, session.ID); !errors.Is(err, domain.ErrSessionNotActive) {
-		t.Fatalf("second checkout error = %v, want ErrSessionNotActive", err)
+	// A repeated checkout is idempotent: it answers with the payment the first
+	// checkout made instead of failing.
+	again, second, err := sessions.Checkout(ctx, session.ID)
+	if err != nil {
+		t.Fatalf("second checkout: %v", err)
+	}
+	if again.Status != domain.SessionCheckedOut {
+		t.Errorf("status = %q, want %q", again.Status, domain.SessionCheckedOut)
+	}
+	if second.ID != pending.ID {
+		t.Errorf("payment id = %q, want the first payment %q", second.ID, pending.ID)
+	}
+	if second.Status != domain.PaymentPending {
+		t.Errorf("payment status = %q, want %q", second.Status, domain.PaymentPending)
 	}
 
-	// The second checkout is a conflict and never reaches payment creation, so
-	// the session keeps exactly the one payment the first checkout made.
+	// The session keeps exactly the one payment the first checkout made.
 	stored, err := payments.GetBySession(ctx, session.ID)
 	if err != nil {
 		t.Fatalf("get payment by session: %v", err)
@@ -259,10 +270,21 @@ func TestCheckoutStaysCheckedOutWhenTheProviderFails(t *testing.T) {
 		t.Errorf("payment status = %q, want %q", pending.Status, domain.PaymentPending)
 	}
 
-	// Repeating the checkout is a conflict that reaches neither the payment
-	// service nor the provider, so the one payment survives unchanged.
-	if _, _, err := sessionService.Checkout(ctx, session.ID); !errors.Is(err, domain.ErrSessionNotActive) {
-		t.Fatalf("second checkout error = %v, want ErrSessionNotActive", err)
+	// A retried checkout returns the same PENDING payment without reaching the
+	// provider again, so the retry can neither charge twice nor open a second
+	// order.
+	retried, retriedPayment, err := sessionService.Checkout(ctx, session.ID)
+	if err != nil {
+		t.Fatalf("retried checkout: %v", err)
+	}
+	if retried.Status != domain.SessionCheckedOut {
+		t.Errorf("retried session status = %q, want %q", retried.Status, domain.SessionCheckedOut)
+	}
+	if retriedPayment.ID != pending.ID {
+		t.Errorf("retried payment id = %q, want the only payment %q", retriedPayment.ID, pending.ID)
+	}
+	if retriedPayment.Status != domain.PaymentPending {
+		t.Errorf("retried payment status = %q, want %q", retriedPayment.Status, domain.PaymentPending)
 	}
 	if provider.createCalls != 1 {
 		t.Errorf("provider calls = %d, want exactly one", provider.createCalls)

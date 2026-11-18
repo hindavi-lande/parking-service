@@ -40,6 +40,13 @@ type Payment struct {
 	// with. It is never logged and is cleared once the payment reaches a
 	// terminal status.
 	ClientSecret string
-	CreatedAt    time.Time
-	UpdatedAt    time.Time
+	// ProviderOrderID is the provider's order identifier the client launches its
+	// checkout with. It is empty for a provider without the concept.
+	ProviderOrderID string
+	// ProviderKeyID is the publishable key the client launches the provider
+	// checkout with. It is not a secret and is empty for a provider that needs
+	// none.
+	ProviderKeyID string
+	CreatedAt     time.Time
+	UpdatedAt     time.Time
 }

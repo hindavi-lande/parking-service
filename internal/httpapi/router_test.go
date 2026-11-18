@@ -180,6 +180,8 @@ type paymentBody struct {
 	UpdatedAt      time.Time `json:"updatedAt"`
 	ClientSecret   string    `json:"clientSecret"`
 	FailureMessage string    `json:"failureMessage"`
+	OrderID        string    `json:"orderId"`
+	KeyID          string    `json:"keyId"`
 }
 
 type problemBody struct {
@@ -409,12 +411,18 @@ func TestCheckInAndCheckout(t *testing.T) {
 		t.Errorf("session = %+v, want a checked-out session with a timestamp", checkedOut)
 	}
 
+	// A repeated checkout is idempotent: it answers 200 with the same payment
+	// instead of a conflict.
 	resp, payload = request(t, server, http.MethodPost, "/api/v1/sessions/"+session.ID+"/checkout", nil)
-	if resp.StatusCode != http.StatusConflict {
-		t.Fatalf("second checkout status = %d, want 409", resp.StatusCode)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("second checkout status = %d, want 200, body = %s", resp.StatusCode, payload)
 	}
-	if got := decode[problemBody](t, payload).Code; got != "SESSION_NOT_ACTIVE" {
-		t.Errorf("code = %q, want SESSION_NOT_ACTIVE", got)
+	repeated := decode[sessionBody](t, payload)
+	if repeated.Payment == nil {
+		t.Fatalf("second checkout response %+v has no payment", repeated)
+	}
+	if checkedOut.Payment == nil || repeated.Payment.ID != checkedOut.Payment.ID {
+		t.Errorf("second checkout payment = %+v, want the payment %+v of the first checkout", repeated.Payment, checkedOut.Payment)
 	}
 }
 
@@ -720,16 +728,24 @@ func TestCheckoutTwiceReturnsOnePayment(t *testing.T) {
 		t.Fatalf("checkout response %+v has no payment", first)
 	}
 
+	// A repeated checkout is idempotent: it answers 200 with the payment the
+	// first checkout made.
 	resp, payload = request(t, server, http.MethodPost, "/api/v1/sessions/"+session.ID+"/checkout", nil)
-	if resp.StatusCode != http.StatusConflict {
-		t.Fatalf("second checkout status = %d, want 409, body = %s", resp.StatusCode, payload)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("second checkout status = %d, want 200, body = %s", resp.StatusCode, payload)
 	}
-	if got := decode[problemBody](t, payload).Code; got != "SESSION_NOT_ACTIVE" {
-		t.Errorf("code = %q, want SESSION_NOT_ACTIVE", got)
+	second := decode[sessionBody](t, payload)
+	if second.Payment == nil {
+		t.Fatalf("second checkout response %+v has no payment", second)
+	}
+	if second.Payment.ID != first.Payment.ID {
+		t.Errorf("payment id = %q, want the only payment %q", second.Payment.ID, first.Payment.ID)
+	}
+	if second.Payment.Amount != first.Payment.Amount {
+		t.Errorf("amount = %d, want the same %d", second.Payment.Amount, first.Payment.Amount)
 	}
 
-	// The second checkout is a conflict and never reaches payment creation, so
-	// the session keeps exactly the one payment the first checkout made.
+	// The session keeps exactly the one payment the first checkout made.
 	stored, err := payments.GetBySession(ctx, session.ID)
 	if err != nil {
 		t.Fatalf("get payment by session: %v", err)
@@ -819,6 +835,60 @@ func TestPaymentResponseCarriesOptionalProviderDetails(t *testing.T) {
 	}
 	if value, ok := raw["clientSecret"]; ok {
 		t.Errorf("response carries clientSecret = %s, want it omitted when empty", value)
+	}
+}
+
+// TestPaymentResponseCarriesProviderOrderDetails seeds a payment with the order
+// details a Razorpay checkout leaves behind and reads it back, so the persisted
+// order id and publishable key id have a read path of their own rather than only
+// appearing in the checkout response.
+func TestPaymentResponseCarriesProviderOrderDetails(t *testing.T) {
+	server, payments := newTestServerWithStores(t, nil)
+	ctx := context.Background()
+	now := time.Date(2026, time.November, 17, 9, 0, 0, 0, time.UTC)
+
+	seeded := domain.Payment{
+		ID:              "pay_with_order",
+		SessionID:       "ses_with_order",
+		LotID:           "lot_seeded",
+		Amount:          testHourlyRate,
+		Currency:        domain.CurrencyINR,
+		Provider:        payment.RazorpayProviderName,
+		Status:          domain.PaymentPending,
+		ProviderOrderID: "order_seeded",
+		ProviderKeyID:   "rzp_test_key_id",
+		CreatedAt:       now,
+		UpdatedAt:       now,
+	}
+	if err := payments.Create(ctx, seeded); err != nil {
+		t.Fatalf("seed payment: %v", err)
+	}
+
+	resp, payload := request(t, server, http.MethodGet, "/api/v1/payments/"+seeded.ID, nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("get payment status = %d, body = %s", resp.StatusCode, payload)
+	}
+	if got := decode[paymentBody](t, payload); got.OrderID != "order_seeded" || got.KeyID != "rzp_test_key_id" {
+		t.Errorf("payment = %+v, want the stored order id and key id", got)
+	}
+
+	// A payment from a provider without the concept carries neither key.
+	_, session := checkoutAndPay(t, server, 1)
+	if session.Payment == nil {
+		t.Fatalf("checkout response %+v has no payment", session)
+	}
+	resp, payload = request(t, server, http.MethodGet, "/api/v1/payments/"+session.Payment.ID, nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("get payment status = %d, body = %s", resp.StatusCode, payload)
+	}
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(payload, &raw); err != nil {
+		t.Fatalf("decode response %q: %v", payload, err)
+	}
+	for _, field := range []string{"orderId", "keyId"} {
+		if value, ok := raw[field]; ok {
+			t.Errorf("response carries %s = %s, want it omitted when empty", field, value)
+		}
 	}
 }
 
