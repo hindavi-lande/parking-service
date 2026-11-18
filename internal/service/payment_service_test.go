@@ -1,9 +1,11 @@
 package service_test
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"testing"
 	"time"
 
@@ -24,6 +26,8 @@ type recordingProvider struct {
 	createCalls  []payment.CreateRequest
 	createErr    error
 	clientSecret string
+	orderID      string
+	keyID        string
 	event        payment.WebhookEvent
 }
 
@@ -39,7 +43,7 @@ func (p *recordingProvider) CreatePayment(_ context.Context, req payment.CreateR
 	if p.createErr != nil {
 		return payment.CreateResult{}, p.createErr
 	}
-	return payment.CreateResult{ClientSecret: p.clientSecret}, nil
+	return payment.CreateResult{ClientSecret: p.clientSecret, OrderID: p.orderID, KeyID: p.keyID}, nil
 }
 
 func (p *recordingProvider) ParseWebhook(_ context.Context, _ payment.WebhookRequest) (payment.WebhookEvent, error) {
@@ -358,6 +362,363 @@ func TestCreateForCheckoutStoresTheProvidersClientSecret(t *testing.T) {
 	}
 	if stored.Status != domain.PaymentPending {
 		t.Errorf("status = %q, want %q", stored.Status, domain.PaymentPending)
+	}
+}
+
+func TestCreateForCheckoutStoresProviderOrderDetails(t *testing.T) {
+	provider := &recordingProvider{
+		name:    payment.RazorpayProviderName,
+		orderID: "order_1",
+		keyID:   "rzp_test_key_id",
+	}
+	svc, payments, lots := newPaymentService(t, provider, 5000)
+	lot := seededLot(t, lots, nil)
+	session := finishedSession("ses_order", lot.ID, time.Hour)
+	ctx := context.Background()
+
+	created, err := svc.CreateForCheckout(ctx, session)
+	if err != nil {
+		t.Fatalf("create payment: %v", err)
+	}
+	if created.ProviderOrderID != "order_1" {
+		t.Errorf("order id = %q, want order_1", created.ProviderOrderID)
+	}
+	if created.ProviderKeyID != "rzp_test_key_id" {
+		t.Errorf("key id = %q, want the configured key id", created.ProviderKeyID)
+	}
+	if created.ClientSecret != "" {
+		t.Errorf("client secret = %q, want none for a provider without one", created.ClientSecret)
+	}
+
+	// The order details are stored with the payment, not only returned once, so
+	// reading the payment back or retrying the checkout finds them again.
+	stored, err := payments.Get(ctx, created.ID)
+	if err != nil {
+		t.Fatalf("get stored payment: %v", err)
+	}
+	if stored.ProviderOrderID != "order_1" || stored.ProviderKeyID != "rzp_test_key_id" {
+		t.Errorf("stored payment = %+v, want the provider order details", stored)
+	}
+
+	retried, err := svc.CreateForCheckout(ctx, session)
+	if err != nil {
+		t.Fatalf("retry create payment: %v", err)
+	}
+	if retried.ID != created.ID {
+		t.Errorf("retried payment id = %q, want %q", retried.ID, created.ID)
+	}
+	if retried.ProviderOrderID != "order_1" || retried.ProviderKeyID != "rzp_test_key_id" {
+		t.Errorf("retried payment = %+v, want the stored order details", retried)
+	}
+	if len(provider.createCalls) != 1 {
+		t.Errorf("provider calls = %d, want exactly one", len(provider.createCalls))
+	}
+}
+
+// recordingRazorpayProvider answers like Razorpay without any network call: it
+// opens an order and replays a configured webhook event.
+type recordingRazorpayProvider struct {
+	createCalls []payment.CreateRequest
+	event       payment.WebhookEvent
+}
+
+func (p *recordingRazorpayProvider) Name() string { return payment.RazorpayProviderName }
+
+func (p *recordingRazorpayProvider) CreatePayment(_ context.Context, req payment.CreateRequest) (payment.CreateResult, error) {
+	p.createCalls = append(p.createCalls, req)
+	return payment.CreateResult{OrderID: "order_1", KeyID: "rzp_test_key_id"}, nil
+}
+
+func (p *recordingRazorpayProvider) ParseWebhook(_ context.Context, _ payment.WebhookRequest) (payment.WebhookEvent, error) {
+	return p.event, nil
+}
+
+// amountPtr is the amount a Razorpay event reports, in minor units.
+func amountPtr(amount int64) *int64 {
+	return &amount
+}
+
+func TestHandleRazorpayWebhookSettlesPayments(t *testing.T) {
+	cases := []struct {
+		name       string
+		status     domain.PaymentStatus
+		reason     string
+		wantReason string
+	}{
+		{name: "captured marks the payment paid", status: domain.PaymentPaid},
+		{
+			name:       "failed marks the payment failed with the provider reason",
+			status:     domain.PaymentFailed,
+			reason:     "Your card was declined.",
+			wantReason: "Your card was declined.",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			provider := &recordingRazorpayProvider{}
+			svc, payments, lots := newPaymentService(t, provider, 5000)
+			lot := seededLot(t, lots, nil)
+			session := finishedSession("ses_razorpay_settle", lot.ID, time.Hour)
+			ctx := context.Background()
+
+			created, err := svc.CreateForCheckout(ctx, session)
+			if err != nil {
+				t.Fatalf("create payment: %v", err)
+			}
+
+			provider.event = payment.WebhookEvent{
+				PaymentID:      created.ID,
+				Status:         tc.status,
+				EventID:        "evt_razorpay_settle",
+				FailureMessage: tc.reason,
+				Amount:         amountPtr(created.Amount),
+				Currency:       created.Currency,
+			}
+			settled, err := svc.HandleRazorpayWebhook(ctx, payment.WebhookRequest{})
+			if err != nil {
+				t.Fatalf("razorpay webhook: %v", err)
+			}
+			if settled.Status != tc.status {
+				t.Errorf("status = %q, want %q", settled.Status, tc.status)
+			}
+			if settled.FailureMessage != tc.wantReason {
+				t.Errorf("failure message = %q, want %q", settled.FailureMessage, tc.wantReason)
+			}
+
+			stored, err := payments.Get(ctx, created.ID)
+			if err != nil {
+				t.Fatalf("get payment: %v", err)
+			}
+			if stored.Status != tc.status || stored.FailureMessage != tc.wantReason {
+				t.Errorf("stored payment = %+v, want %q with failure message %q", stored, tc.status, tc.wantReason)
+			}
+		})
+	}
+}
+
+// TestHandleRazorpayWebhookRejectsAmountMismatch covers a captured event that
+// reports a different amount or currency than the payment was created for: the
+// event is rejected, logged and recorded as consumed, so the payment stays
+// PENDING and a replay changes nothing.
+func TestHandleRazorpayWebhookRejectsAmountMismatch(t *testing.T) {
+	logs := &bytes.Buffer{}
+	previous := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(logs, nil)))
+	t.Cleanup(func() { slog.SetDefault(previous) })
+
+	cases := []struct {
+		name     string
+		amount   *int64
+		currency string
+		field    string
+	}{
+		{name: "amount mismatch", amount: amountPtr(1), currency: domain.CurrencyINR, field: "amount"},
+		{name: "currency mismatch", amount: amountPtr(5000), currency: "USD", field: "currency"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			logs.Reset()
+
+			provider := &recordingRazorpayProvider{}
+			svc, payments, lots := newPaymentService(t, provider, 5000)
+			lot := seededLot(t, lots, nil)
+			session := finishedSession("ses_razorpay_mismatch", lot.ID, time.Hour)
+			ctx := context.Background()
+
+			created, err := svc.CreateForCheckout(ctx, session)
+			if err != nil {
+				t.Fatalf("create payment: %v", err)
+			}
+
+			provider.event = payment.WebhookEvent{
+				PaymentID: created.ID,
+				Status:    domain.PaymentPaid,
+				EventID:   "evt_razorpay_mismatch",
+				Amount:    tc.amount,
+				Currency:  tc.currency,
+			}
+			_, err = svc.HandleRazorpayWebhook(ctx, payment.WebhookRequest{})
+
+			var validation *domain.ValidationError
+			if !errors.As(err, &validation) {
+				t.Fatalf("error = %v, want a ValidationError", err)
+			}
+			if validation.Field != tc.field {
+				t.Errorf("field = %q, want %q", validation.Field, tc.field)
+			}
+
+			stored, err := payments.Get(ctx, created.ID)
+			if err != nil {
+				t.Fatalf("get payment: %v", err)
+			}
+			if stored.Status != domain.PaymentPending {
+				t.Errorf("status = %q, want %q after a rejected event", stored.Status, domain.PaymentPending)
+			}
+
+			// The rejection is logged with the payment and the event, and the
+			// event id is consumed so a replay is a no-op.
+			logged := logs.String()
+			if !bytes.Contains(logs.Bytes(), []byte(created.ID)) || !bytes.Contains(logs.Bytes(), []byte("evt_razorpay_mismatch")) {
+				t.Errorf("log = %q, want the payment id and the event id", logged)
+			}
+			processed, err := payments.IsEventProcessed(ctx, "evt_razorpay_mismatch")
+			if err != nil {
+				t.Fatalf("is event processed: %v", err)
+			}
+			if !processed {
+				t.Error("evt_razorpay_mismatch is not recorded although it was consumed")
+			}
+
+			replayed, err := svc.HandleRazorpayWebhook(ctx, payment.WebhookRequest{})
+			if err != nil {
+				t.Fatalf("replayed webhook: %v", err)
+			}
+			if replayed.ID != created.ID || replayed.Status != domain.PaymentPending || !replayed.UpdatedAt.Equal(stored.UpdatedAt) {
+				t.Errorf("replayed payment = %+v, want the unchanged %+v", replayed, stored)
+			}
+		})
+	}
+}
+
+func TestHandleRazorpayWebhookIsIdempotent(t *testing.T) {
+	provider := &recordingRazorpayProvider{}
+	now := paymentClock
+	clock := func() time.Time { return now }
+	svc, payments, lots := newPaymentServiceWithClock(t, provider, 5000, clock)
+	lot := seededLot(t, lots, nil)
+	session := finishedSession("ses_razorpay_repeat", lot.ID, time.Hour)
+	ctx := context.Background()
+
+	created, err := svc.CreateForCheckout(ctx, session)
+	if err != nil {
+		t.Fatalf("create payment: %v", err)
+	}
+
+	provider.event = payment.WebhookEvent{
+		PaymentID: created.ID,
+		Status:    domain.PaymentPaid,
+		EventID:   "evt_razorpay_paid",
+		Amount:    amountPtr(created.Amount),
+		Currency:  created.Currency,
+	}
+	first, err := svc.HandleRazorpayWebhook(ctx, payment.WebhookRequest{})
+	if err != nil {
+		t.Fatalf("razorpay webhook: %v", err)
+	}
+	now = now.Add(time.Hour)
+
+	// The same event id again: success, and the payment is untouched.
+	repeated, err := svc.HandleRazorpayWebhook(ctx, payment.WebhookRequest{})
+	if err != nil {
+		t.Fatalf("repeated webhook: %v", err)
+	}
+	if repeated.Status != domain.PaymentPaid || !repeated.UpdatedAt.Equal(first.UpdatedAt) {
+		t.Errorf("payment = %+v, want the unchanged %+v", repeated, first)
+	}
+
+	// A different event for the now-terminal payment: success, still untouched.
+	provider.event = payment.WebhookEvent{
+		PaymentID:      created.ID,
+		Status:         domain.PaymentFailed,
+		EventID:        "evt_razorpay_late",
+		FailureMessage: "too late",
+		Amount:         amountPtr(created.Amount),
+		Currency:       created.Currency,
+	}
+	terminal, err := svc.HandleRazorpayWebhook(ctx, payment.WebhookRequest{})
+	if err != nil {
+		t.Fatalf("terminal webhook: %v", err)
+	}
+	if terminal.Status != domain.PaymentPaid || terminal.FailureMessage != "" || !terminal.UpdatedAt.Equal(first.UpdatedAt) {
+		t.Errorf("payment = %+v, want the unchanged %+v", terminal, first)
+	}
+
+	stored, err := payments.Get(ctx, created.ID)
+	if err != nil {
+		t.Fatalf("get payment: %v", err)
+	}
+	if stored.Status != domain.PaymentPaid || stored.FailureMessage != "" || !stored.UpdatedAt.Equal(first.UpdatedAt) {
+		t.Errorf("stored payment = %+v, want the paid payment unchanged", stored)
+	}
+
+	// The event that changed nothing is not recorded as handled.
+	processed, err := payments.IsEventProcessed(ctx, "evt_razorpay_late")
+	if err != nil {
+		t.Fatalf("is event processed: %v", err)
+	}
+	if processed {
+		t.Error("evt_razorpay_late is marked as processed although it changed nothing")
+	}
+}
+
+// TestHandleRazorpayWebhookResolvesThePayment covers how the service finds the
+// payment a callback refers to: Razorpay names the payment when it has one and
+// otherwise only the session.
+func TestHandleRazorpayWebhookResolvesThePayment(t *testing.T) {
+	provider := &recordingRazorpayProvider{}
+	svc, _, lots := newPaymentService(t, provider, 5000)
+	lot := seededLot(t, lots, nil)
+	session := finishedSession("ses_razorpay_resolve", lot.ID, time.Hour)
+	ctx := context.Background()
+
+	created, err := svc.CreateForCheckout(ctx, session)
+	if err != nil {
+		t.Fatalf("create payment: %v", err)
+	}
+
+	// An event naming neither a payment nor a session cannot be applied.
+	provider.event = payment.WebhookEvent{Status: domain.PaymentPaid}
+	_, err = svc.HandleRazorpayWebhook(ctx, payment.WebhookRequest{})
+	var validation *domain.ValidationError
+	if !errors.As(err, &validation) {
+		t.Fatalf("error = %v, want a ValidationError", err)
+	}
+
+	provider.event = payment.WebhookEvent{PaymentID: "missing", Status: domain.PaymentPaid}
+	if _, err := svc.HandleRazorpayWebhook(ctx, payment.WebhookRequest{}); !errors.Is(err, domain.ErrNotFound) {
+		t.Errorf("unknown payment error = %v, want ErrNotFound", err)
+	}
+
+	provider.event = payment.WebhookEvent{SessionID: "missing", Status: domain.PaymentPaid}
+	if _, err := svc.HandleRazorpayWebhook(ctx, payment.WebhookRequest{}); !errors.Is(err, domain.ErrNotFound) {
+		t.Errorf("unknown session error = %v, want ErrNotFound", err)
+	}
+
+	// An event that names only the session finds its payment through the
+	// session index.
+	provider.event = payment.WebhookEvent{
+		SessionID: session.ID,
+		Status:    domain.PaymentPaid,
+		EventID:   "evt_razorpay_session_only",
+		Amount:    amountPtr(created.Amount),
+		Currency:  created.Currency,
+	}
+	settled, err := svc.HandleRazorpayWebhook(ctx, payment.WebhookRequest{})
+	if err != nil {
+		t.Fatalf("razorpay webhook: %v", err)
+	}
+	if settled.ID != created.ID {
+		t.Errorf("payment id = %q, want %q", settled.ID, created.ID)
+	}
+	if settled.Status != domain.PaymentPaid {
+		t.Errorf("status = %q, want %q", settled.Status, domain.PaymentPaid)
+	}
+}
+
+func TestHandleRazorpayWebhookRejectsANonRazorpayProvider(t *testing.T) {
+	provider := &recordingProvider{name: payment.FakeProviderName}
+	svc, _, _ := newPaymentService(t, provider, 5000)
+
+	_, err := svc.HandleRazorpayWebhook(context.Background(), payment.WebhookRequest{})
+
+	var validation *domain.ValidationError
+	if !errors.As(err, &validation) {
+		t.Fatalf("error = %v, want a ValidationError", err)
+	}
+	if validation.Field != "provider" {
+		t.Errorf("field = %q, want provider", validation.Field)
 	}
 }
 

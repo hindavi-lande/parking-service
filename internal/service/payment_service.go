@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"strings"
 	"time"
 
@@ -22,6 +23,10 @@ type PaymentService struct {
 	provider          payment.Provider
 	defaultHourlyRate int64
 	now               func() time.Time
+	// logger records a rejected provider callback, such as a captured event
+	// whose amount or currency does not match the stored payment. It never logs
+	// a provider credential.
+	logger *slog.Logger
 }
 
 // NewPaymentService wires the payment rules to their collaborators.
@@ -37,6 +42,7 @@ func NewPaymentService(payments store.PaymentStore, lots store.LotStore, provide
 		provider:          provider,
 		defaultHourlyRate: defaultHourlyRate,
 		now:               now,
+		logger:            slog.Default(),
 	}
 }
 
@@ -105,12 +111,17 @@ func (s *PaymentService) CreateForCheckout(ctx context.Context, session domain.S
 		return domain.Payment{}, fmt.Errorf("create payment for session %q: %w", session.ID, err)
 	}
 
-	// The client secret is the one part of the provider's answer the service
-	// keeps, so the stored payment carries it until the payment is settled.
-	if result.ClientSecret != "" {
+	// The client secret and the provider's order details are the parts of the
+	// provider's answer the service keeps, so the stored payment carries them
+	// until the payment is settled. The order details survive a reload, so a
+	// retried checkout answers with the same order instead of opening a second
+	// one.
+	if result.ClientSecret != "" || result.OrderID != "" || result.KeyID != "" {
 		pending.ClientSecret = result.ClientSecret
+		pending.ProviderOrderID = result.OrderID
+		pending.ProviderKeyID = result.KeyID
 		if err := s.payments.Update(ctx, pending); err != nil {
-			return domain.Payment{}, fmt.Errorf("store client secret for session %q: %w", session.ID, err)
+			return domain.Payment{}, fmt.Errorf("store provider details for session %q: %w", session.ID, err)
 		}
 	}
 	return pending, nil
@@ -215,6 +226,124 @@ func (s *PaymentService) HandleStripeWebhook(ctx context.Context, req payment.We
 		}
 	}
 	return settled, nil
+}
+
+// HandleRazorpayWebhook applies a Razorpay callback to a pending payment. Like
+// HandleStripeWebhook it is idempotent: a repeated event id, or an event for a
+// payment that already reached a terminal status, returns the stored payment
+// and a nil error, so Razorpay can stop retrying. It differs in two ways: the
+// event may name the session instead of the payment, and a captured event has to
+// report the amount and currency the payment was created for. A mismatch is
+// logged, records the event id as consumed and returns a validation error, so
+// the payment stays PENDING and a replay changes nothing.
+func (s *PaymentService) HandleRazorpayWebhook(ctx context.Context, req payment.WebhookRequest) (domain.Payment, error) {
+	if s.provider == nil {
+		return domain.Payment{}, errors.New("handle razorpay webhook: no payment provider configured")
+	}
+	if s.provider.Name() != payment.RazorpayProviderName {
+		return domain.Payment{}, &domain.ValidationError{
+			Field:   "provider",
+			Message: fmt.Sprintf("must be %q", payment.RazorpayProviderName),
+		}
+	}
+
+	event, err := s.provider.ParseWebhook(ctx, req)
+	if err != nil {
+		return domain.Payment{}, &domain.ValidationError{Field: "body", Message: fmt.Sprintf("is not a valid %s webhook: %v", payment.RazorpayProviderName, err)}
+	}
+
+	existing, err := s.resolveWebhookPayment(ctx, event)
+	if err != nil {
+		return domain.Payment{}, err
+	}
+
+	// An event that was already handled and an event for a payment that can no
+	// longer change are both reported as success: the caller gets the stored
+	// payment back and nothing is written.
+	if event.EventID != "" {
+		processed, err := s.payments.IsEventProcessed(ctx, event.EventID)
+		if err != nil {
+			return domain.Payment{}, fmt.Errorf("check razorpay event %q: %w", event.EventID, err)
+		}
+		if processed {
+			return existing, nil
+		}
+	}
+	if existing.IsTerminal() {
+		return existing, nil
+	}
+
+	// A callback that reports a different amount or currency than the payment
+	// was created for is not applied. The event id is recorded so a replay is
+	// answered with the stored payment, and the rejection names the field while
+	// the payment stays PENDING.
+	field, expected, reported := "", "", ""
+	switch {
+	case event.Amount != nil && *event.Amount != existing.Amount:
+		field = "amount"
+		expected = fmt.Sprintf("%d", existing.Amount)
+		reported = fmt.Sprintf("%d", *event.Amount)
+	case event.Currency != "" && !strings.EqualFold(strings.TrimSpace(event.Currency), existing.Currency):
+		field = "currency"
+		expected = existing.Currency
+		reported = event.Currency
+	}
+	if field != "" {
+		if event.EventID != "" {
+			if err := s.payments.MarkEventProcessed(ctx, event.EventID); err != nil {
+				return domain.Payment{}, fmt.Errorf("mark razorpay event %q: %w", event.EventID, err)
+			}
+		}
+		s.logger.Error("reject razorpay webhook: reported value does not match the payment",
+			"payment_id", existing.ID,
+			"event_id", event.EventID,
+			"field", field,
+			"expected", expected,
+			"reported", reported,
+		)
+		return domain.Payment{}, &domain.ValidationError{
+			Field:   field,
+			Message: fmt.Sprintf("does not match the stored payment: expected %s, got %s", expected, reported),
+		}
+	}
+
+	settled, err := s.applyStatus(ctx, existing, event.Status, event.FailureMessage)
+	if err != nil {
+		return domain.Payment{}, err
+	}
+
+	// The event id is marked only once the status change is stored, so a failed
+	// write leaves the callback retryable.
+	if event.EventID != "" {
+		if err := s.payments.MarkEventProcessed(ctx, event.EventID); err != nil {
+			return domain.Payment{}, fmt.Errorf("mark razorpay event %q: %w", event.EventID, err)
+		}
+	}
+	return settled, nil
+}
+
+// resolveWebhookPayment finds the stored payment a callback refers to. Razorpay
+// names the payment when it has one and otherwise only the session, so the
+// session index is the fallback. An event that names neither cannot be applied.
+func (s *PaymentService) resolveWebhookPayment(ctx context.Context, event payment.WebhookEvent) (domain.Payment, error) {
+	if event.PaymentID != "" {
+		existing, err := s.payments.Get(ctx, event.PaymentID)
+		if err != nil {
+			return domain.Payment{}, fmt.Errorf("get payment %q: %w", event.PaymentID, err)
+		}
+		return existing, nil
+	}
+	if event.SessionID != "" {
+		existing, err := s.payments.GetBySession(ctx, event.SessionID)
+		if err != nil {
+			return domain.Payment{}, fmt.Errorf("get payment for session %q: %w", event.SessionID, err)
+		}
+		return existing, nil
+	}
+	return domain.Payment{}, &domain.ValidationError{
+		Field:   "payment",
+		Message: "the event names neither a payment nor a session",
+	}
 }
 
 // applyStatus is the PENDING → PAID / PENDING → FAILED state machine. A payment

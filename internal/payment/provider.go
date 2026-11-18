@@ -17,6 +17,10 @@ const (
 	// is declared here so internal/service can recognise the Stripe provider
 	// without importing the client package.
 	StripeProviderName = "stripe"
+	// RazorpayProviderName is the provider PAYMENT_PROVIDER selects for
+	// Razorpay. Like StripeProviderName it is declared here so internal/service
+	// can recognise the provider without importing the client package.
+	RazorpayProviderName = "razorpay"
 )
 
 // CreateRequest is everything a provider needs to open a payment. Amount is an
@@ -34,6 +38,12 @@ type CreateRequest struct {
 // with; the zero value means the provider issues no client secret.
 type CreateResult struct {
 	ClientSecret string
+	// OrderID is the provider's order identifier the client launches its
+	// checkout with. It is empty for a provider without the concept.
+	OrderID string
+	// KeyID is the publishable key the client launches the provider checkout
+	// with. It is not a secret and is empty for a provider that needs none.
+	KeyID string
 }
 
 // WebhookRequest is a raw provider callback. Body is the untouched request body
@@ -55,6 +65,16 @@ type WebhookEvent struct {
 	// FailureMessage is the provider's human-readable reason for a failure. It
 	// is empty unless the event reports one.
 	FailureMessage string
+	// SessionID is the session the provider's callback names. It is empty when
+	// the provider reports none, and is the fallback the service uses when the
+	// event carries no PaymentID.
+	SessionID string
+	// Amount is the amount the provider reports, in minor units. It is nil when
+	// the provider reports no amount, which is distinct from an amount of zero.
+	Amount *int64
+	// Currency is the currency the provider reports. It is empty when the
+	// provider reports none.
+	Currency string
 }
 
 // Provider opens a payment and reports what a callback means.

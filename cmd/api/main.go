@@ -41,10 +41,14 @@ func main() {
 	}, logger)
 
 	provider, err := payments.FromSettings(payments.Settings{
-		Name:                cfg.PaymentProvider,
-		StripeSecretKey:     cfg.StripeSecretKey,
-		StripeWebhookSecret: cfg.StripeWebhookSecret,
-		StripeBaseURL:       cfg.StripeBaseURL,
+		Name:                  cfg.PaymentProvider,
+		StripeSecretKey:       cfg.StripeSecretKey,
+		StripeWebhookSecret:   cfg.StripeWebhookSecret,
+		StripeBaseURL:         cfg.StripeBaseURL,
+		RazorpayKeyID:         cfg.RazorpayKeyID,
+		RazorpayKeySecret:     cfg.RazorpayKeySecret,
+		RazorpayWebhookSecret: cfg.RazorpayWebhookSecret,
+		RazorpayBaseURL:       cfg.RazorpayBaseURL,
 	})
 	if err != nil {
 		logger.Error("select payment provider", "error", err)

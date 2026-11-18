@@ -158,3 +158,90 @@ func TestLoadWithoutStripeSettingsUsesTheFakeProvider(t *testing.T) {
 		t.Errorf("base url = %q, want the empty default", cfg.StripeBaseURL)
 	}
 }
+
+func TestLoadRequiresRazorpaySettingsWhenRazorpayIsSelected(t *testing.T) {
+	cases := []struct {
+		name        string
+		keyID       string
+		keySecret   string
+		webhookKey  string
+		wantMissing string
+	}{
+		{name: "missing all", keyID: "", keySecret: "", webhookKey: "", wantMissing: "RAZORPAY_KEY_ID"},
+		{name: "missing key id", keyID: "", keySecret: "rzp_secret_config", webhookKey: "whsec_rzp_config", wantMissing: "RAZORPAY_KEY_ID"},
+		{name: "missing key secret", keyID: "rzp_test_config", keySecret: "", webhookKey: "whsec_rzp_config", wantMissing: "RAZORPAY_KEY_SECRET"},
+		{name: "missing webhook secret", keyID: "rzp_test_config", keySecret: "rzp_secret_config", webhookKey: "", wantMissing: "RAZORPAY_WEBHOOK_SECRET"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("PAYMENT_HOURLY_RATE", "5000")
+			t.Setenv("PAYMENT_PROVIDER", "  RAZORPAY ")
+			t.Setenv("RAZORPAY_KEY_ID", tc.keyID)
+			t.Setenv("RAZORPAY_KEY_SECRET", tc.keySecret)
+			t.Setenv("RAZORPAY_WEBHOOK_SECRET", tc.webhookKey)
+
+			_, err := config.Load()
+			if err == nil {
+				t.Fatal("expected a configuration error")
+			}
+			if !strings.Contains(err.Error(), tc.wantMissing) {
+				t.Errorf("error = %v, want it to name %s", err, tc.wantMissing)
+			}
+		})
+	}
+}
+
+func TestLoadReadsRazorpaySettings(t *testing.T) {
+	t.Setenv("PAYMENT_HOURLY_RATE", "5000")
+	t.Setenv("PAYMENT_PROVIDER", "razorpay")
+	t.Setenv("RAZORPAY_KEY_ID", "rzp_test_config")
+	t.Setenv("RAZORPAY_KEY_SECRET", "rzp_secret_config")
+	t.Setenv("RAZORPAY_WEBHOOK_SECRET", "whsec_rzp_config")
+	t.Setenv("RAZORPAY_API_BASE_URL", "http://127.0.0.1:12112")
+
+	cfg, err := config.Load()
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if cfg.RazorpayKeyID != "rzp_test_config" {
+		t.Errorf("key id = %q, want the configured value", cfg.RazorpayKeyID)
+	}
+	if cfg.RazorpayKeySecret != "rzp_secret_config" {
+		t.Errorf("key secret = %q, want the configured value", cfg.RazorpayKeySecret)
+	}
+	if cfg.RazorpayWebhookSecret != "whsec_rzp_config" {
+		t.Errorf("webhook secret = %q, want the configured value", cfg.RazorpayWebhookSecret)
+	}
+	if cfg.RazorpayBaseURL != "http://127.0.0.1:12112" {
+		t.Errorf("base url = %q, want the configured value", cfg.RazorpayBaseURL)
+	}
+}
+
+func TestLoadNeverEchoesRazorpaySecrets(t *testing.T) {
+	const keySecret = "rzp_secret_never_echo_this"
+	const webhookSecret = "whsec_rzp_never_echo_this"
+
+	t.Setenv("PAYMENT_HOURLY_RATE", "5000")
+	t.Setenv("PAYMENT_PROVIDER", "razorpay")
+	t.Setenv("RAZORPAY_KEY_ID", "rzp_test_never_echo")
+	t.Setenv("RAZORPAY_KEY_SECRET", keySecret)
+	t.Setenv("RAZORPAY_WEBHOOK_SECRET", webhookSecret)
+
+	if _, err := config.Load(); err != nil {
+		t.Fatalf("load with all three settings: %v", err)
+	}
+
+	// A failing load names the missing variable and neither value.
+	t.Setenv("RAZORPAY_WEBHOOK_SECRET", "")
+	_, err := config.Load()
+	if err == nil {
+		t.Fatal("expected a configuration error for the missing webhook secret")
+	}
+	if !strings.Contains(err.Error(), "RAZORPAY_WEBHOOK_SECRET") {
+		t.Errorf("error = %v, want it to name RAZORPAY_WEBHOOK_SECRET", err)
+	}
+	if strings.Contains(err.Error(), keySecret) || strings.Contains(err.Error(), webhookSecret) {
+		t.Errorf("error = %v, want neither secret in the message", err)
+	}
+}

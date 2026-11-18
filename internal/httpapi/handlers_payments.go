@@ -31,6 +31,12 @@ type paymentResponse struct {
 	// payment from the fake provider keeps its existing shape.
 	ClientSecret   string `json:"clientSecret,omitempty"`
 	FailureMessage string `json:"failureMessage,omitempty"`
+	// OrderID and KeyID are the optional provider checkout details: the first is
+	// the provider's order identifier, the second the publishable key the client
+	// launches the provider checkout with. Both are omitted when empty, so a
+	// payment from the fake or Stripe provider keeps its existing shape.
+	OrderID string `json:"orderId,omitempty"`
+	KeyID   string `json:"keyId,omitempty"`
 }
 
 func toPaymentResponse(p domain.Payment) paymentResponse {
@@ -46,6 +52,8 @@ func toPaymentResponse(p domain.Payment) paymentResponse {
 		UpdatedAt:      p.UpdatedAt,
 		ClientSecret:   p.ClientSecret,
 		FailureMessage: p.FailureMessage,
+		OrderID:        p.ProviderOrderID,
+		KeyID:          p.ProviderKeyID,
 	}
 }
 
@@ -105,6 +113,36 @@ func (a *API) stripeWebhook(w http.ResponseWriter, r *http.Request) {
 	}
 
 	settled, err := a.payments.HandleStripeWebhook(r.Context(), payment.WebhookRequest{
+		Body:   body,
+		Header: header,
+	})
+	if err != nil {
+		a.fail(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, toPaymentResponse(settled))
+}
+
+// razorpayWebhook handles the callback Razorpay is configured to send to the
+// fixed /api/v1/payments/razorpay/webhook URL. Like stripeWebhook it reads the
+// body once and passes it on untouched, because X-Razorpay-Signature is
+// verified over the raw bytes; a signature that does not verify, or a captured
+// event whose amount or currency does not match the payment, comes back as a
+// validation error and answers 400 without changing the payment.
+func (a *API) razorpayWebhook(w http.ResponseWriter, r *http.Request) {
+	r.Body = http.MaxBytesReader(w, r.Body, maxRequestBodyBytes)
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		a.badRequest(w, r, fmt.Errorf("invalid request body: %w", err))
+		return
+	}
+
+	header := make(map[string]string, len(r.Header))
+	for name, values := range r.Header {
+		header[strings.ToLower(name)] = strings.Join(values, ", ")
+	}
+
+	settled, err := a.payments.HandleRazorpayWebhook(r.Context(), payment.WebhookRequest{
 		Body:   body,
 		Header: header,
 	})
